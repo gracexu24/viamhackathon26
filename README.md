@@ -201,3 +201,65 @@ Tests use synthetic images/trajectories and mocked motion; they do not move hard
 - [Viam RealSense alignment setup](https://docs.viam.com/tutorials/pick-and-place/configure-resources/)
 - [Viam frame-system API](https://docs.viam.com/motion-planning/reference/frame-system-api/)
 - [Viam perception-guided picking](https://docs.viam.com/tutorials/pick-and-place/perception-guided-picking/)
+
+## Rolling trajectory tracker
+
+From the project directory on Linux, with the existing `.env` credentials:
+
+```bash
+.venv/bin/python -m motion.trajectory_rolling --hz 60
+```
+
+Uses `ball_catch.config.json` by default; override with `--config PATH`.
+Keep the wrist stationary. Ctrl+C stops tracking. This command reports world
+position in meters, velocity in m/s, and upward threshold crossings; it does not
+command the arm. `--print-hz 5` controls console output independently of sampling.
+
+The default localization target is 60 Hz (16.67 ms), independent of the catch
+script's 20 Hz setting. Processing time counts toward that budget. The displayed
+localization rate measures successful results, not camera FPS. Segmenter results
+lack capture timestamps, so velocity uses completion times and is approximate.
+
+Actual 60 FPS capture requires a camera driver and stream profile supporting it.
+The [Viam RealSense module's documented attributes](https://github.com/viam-modules/viam-camera-realsense#attributes)
+do not expose an FPS option. This script cannot set or verify the sensor rate;
+confirm the installed driver and supported color/depth profiles before assuming
+60 FPS capture. Network calls and segmentation can reduce localization throughput
+even when the camera captures at 60 FPS.
+
+## Tracker installed on armfarm14
+
+The local image tracker is installed in `/opt/viam/trajectory-local` on part
+`49d63d4f-4191-4d94-9e43-e379f846dd0e`, with its own Python environment at
+`/opt/viam/trajectory-local-venv`. Run from your laptop:
+
+```bash
+viam machine part shell --part 49d63d4f-4191-4d94-9e43-e379f846dd0e
+```
+
+Then inside that shell:
+
+```bash
+/opt/viam/trajectory-local/run.sh
+```
+
+Ctrl+C stops it. `--duration 10` runs a bounded check; `--print-hz 2` reduces output.
+The source is `motion/trajectory_local.py`. It connects to Viam over loopback TLS,
+reads existing machine credentials in memory, and detects the red ball locally.
+It does not run the object segmenter or command hardware. The launcher does not
+contain API secrets. No service/autostart is installed.
+
+**Default output is pixel UV and pixel velocity, not world XYZ.** Alignment of
+this custom module's returned depth and color has not been verified. Only after
+verifying alignment and color intrinsics, use `--aligned-depth --radius-mm 20`
+(substitute the measured ball radius) for camera-optical XYZ in meters and
+velocity in m/s. Camera Z points forward, not upward; this mode does not report
+world-frame throw detection. Missing/ambiguous detections reset the velocity
+history. The default radius is an assumption, not a measured calibration.
+
+The installed camera config contains `fps: 60`. A local three-second probe on
+2026-09-18 measured 59.53 distinct frame timestamps/s, while segmentation took
+234 ms per call. This custom build may differ from the stock module documentation
+above. The tracker polls at up to 120 Hz to consume that 60 FPS stream, skips
+repeated/stale timestamps, and reports fresh-frame and successful-detection rates
+separately. It does not reconfigure the camera's capture rate.
