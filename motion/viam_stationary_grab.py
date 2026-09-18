@@ -36,7 +36,7 @@ def validate_config(config):
         if not isinstance(config.get(key), str) or not config[key].strip():
             raise ValueError(f"Missing resource/frame name: {key}")
     for key in ("approach_height_mm", "lift_height_mm", "max_reacquire_shift_mm",
-                "stationary_tolerance_mm", "ball_height_tolerance_mm", "move_timeout_s",
+                "stationary_tolerance_mm", "move_timeout_s",
                 "rpc_timeout_s", "max_observation_s", "arrival_tolerance_mm", "settle_s"):
         if not math.isfinite(float(config[key])) or float(config[key]) <= 0:
             raise ValueError(f"{key} must be positive and finite")
@@ -63,35 +63,35 @@ def _xyz(pose):
     return [pose.x, pose.y, pose.z]
 
 
-def _check_bounds(point, config):
-    point = _vector(list(point), 3, "target")
+def _check_bounds(point, config, name="Target"):
+    point = _vector(list(point), 3, name)
     if any(not low <= value <= high for value, low, high in zip(point, *config["workspace_mm"])):
-        raise ValueError(f"Target {point} is outside workspace_mm")
+        raise ValueError(f"{name} {point} is outside workspace_mm")
 
 
 def make_targets(ball, config):
-    """Use detected world XY and the user's taught TCP height for this table.
+    """Use detected world XYZ. Grasp Z is the segment center plus the taught TCP offset.
 
-    The historical 60.64 mm difference is NOT treated as a calibrated tool offset.
-    A changed table/ball height is rejected rather than silently changing grasp Z.
+    grasp_z_world_mm and expected_ball_z_world_mm are a calibration pair: TCP height
+    at the same moment as a measured ball-center height. Their difference is applied
+    to the live point-cloud Z so a tossed or raised ball is followed instead of a table.
     """
     if ball.reference_frame != config["world_frame"]:
         raise ValueError("Ball must be transformed into the configured world frame")
     _vector(_xyz(ball), 3, "ball XYZ")
-    if abs(ball.z-config["expected_ball_z_world_mm"]) > config["ball_height_tolerance_mm"]:
-        raise ValueError("Ball is not on the taught table level")
     dx, dy = config["grasp_xy_offset_mm"]
-    grasp = [ball.x+dx, ball.y+dy, config["grasp_z_world_mm"]]
+    tcp_to_ball_z = config["grasp_z_world_mm"] - config["expected_ball_z_world_mm"]
+    grasp = [ball.x+dx, ball.y+dy, ball.z + tcp_to_ball_z]
     targets = {"grasp": grasp,
                "approach": [grasp[0], grasp[1], grasp[2]+config["approach_height_mm"]],
                "lift": [grasp[0], grasp[1], grasp[2]+config["lift_height_mm"]]}
-    for target in targets.values():
-        _check_bounds(target, config)
+    for name, target in targets.items():
+        _check_bounds(target, config, f"{name} target")
     return targets
 
 
 async def _observe(machine, arm, config):
-    """Three stopped-arm samples, single matching segment, no local RGB-D code."""
+    """One stopped-arm sample. Later frames may lose the ball; callers keep this pose."""
     timeout = config["rpc_timeout_s"]
     if await arm.is_moving(timeout=timeout):
         raise ValueError("Arm must be stopped before wrist-camera localization")
@@ -100,48 +100,44 @@ async def _observe(machine, arm, config):
     if not before or not all(math.isfinite(v) for v in before):
         raise ValueError("Invalid arm joint positions")
     segmenter = VisionClient.from_robot(machine, config["segmenter"])
-    samples = []
     start = time.monotonic()
-    for _ in range(3):
-        detection = await detect_ball(machine, config["detector"], config["camera"], config["ball_label"])
-        if not math.isfinite(detection.confidence) or detection.confidence < 0.5:
-            raise ValueError("Ball detection confidence is below 0.5")
-        objects = await segmenter.get_object_point_clouds(config["camera"], timeout=timeout)
-        candidates = [(obj, geometry) for obj in objects for geometry in obj.geometries.geometries
-                      if geometry.label.strip().casefold() == config["ball_label"].strip().casefold()]
-        if len(candidates) != 1:
-            raise ValueError(f"Expected one ball segment; found {len(candidates)}")
-        obj, geometry = candidates[0]
-        if not obj.point_cloud or not geometry.HasField("center"):
-            raise ValueError("Ball segment has no point cloud or center")
-        # detections-to-segments returns camera coordinates when its frame is unset.
-        source_frame = obj.geometries.reference_frame or config["camera"]
-        center = geometry.center
-        ball = BallPose(center.x, center.y, center.z, source_frame, geometry.label, len(obj.point_cloud))
-        _vector(_xyz(ball), 3, "segment XYZ")
-        world = await asyncio.wait_for(ball_pose_in_world(machine, ball, config["world_frame"]), timeout)
-        _vector(_xyz(world), 3, "world XYZ")
-        samples.append(world)
-        await asyncio.sleep(0.1)
+    detection = await detect_ball(machine, config["detector"], config["camera"], config["ball_label"])
+    if not math.isfinite(detection.confidence) or detection.confidence < 0.5:
+        raise ValueError("Ball detection confidence is below 0.5")
+    objects = await segmenter.get_object_point_clouds(config["camera"], timeout=timeout)
+    candidates = [(obj, geometry) for obj in objects for geometry in obj.geometries.geometries
+                  if geometry.label.strip().casefold() == config["ball_label"].strip().casefold()]
+    if len(candidates) != 1:
+        raise ValueError(f"Expected one ball segment; found {len(candidates)}")
+    obj, geometry = candidates[0]
+    if not obj.point_cloud or not geometry.HasField("center"):
+        raise ValueError("Ball segment has no point cloud or center")
+    # detections-to-segments returns camera coordinates when its frame is unset.
+    source_frame = obj.geometries.reference_frame or config["camera"]
+    center = geometry.center
+    ball = BallPose(center.x, center.y, center.z, source_frame, geometry.label, len(obj.point_cloud))
+    _vector(_xyz(ball), 3, "segment XYZ")
+    world = await asyncio.wait_for(ball_pose_in_world(machine, ball, config["world_frame"]), timeout)
+    _vector(_xyz(world), 3, "world XYZ")
     after = list((await arm.get_joint_positions(timeout=timeout)).values)
     if (await arm.is_moving(timeout=timeout) or len(after) != len(before)
             or not all(math.isfinite(v) for v in after)
             or max(abs(a-b) for a, b in zip(before, after)) > 0.1):
         raise ValueError("Arm moved while localizing; discard camera-to-world result")
-    if time.monotonic()-start > config["max_observation_s"]:
-        raise ValueError("Localization took too long; target is stale")
-    spread = max(math.dist(_xyz(a), _xyz(b)) for a in samples for b in samples)
-    if spread > config["stationary_tolerance_mm"]:
-        positions = [[round(v, 2) for v in _xyz(sample)] for sample in samples]
-        raise ValueError(f"Ball is moving or the 3D detection is unstable: spread={spread:.2f} mm, "
-                         f"limit={config['stationary_tolerance_mm']} mm, world_samples={positions}")
-    return samples[-1], detection
+    elapsed = time.monotonic()-start
+    if elapsed > config["max_observation_s"]:
+        raise ValueError(
+            "Localization took too long; target is stale: "
+            f"elapsed={elapsed:.2f} s, limit={config['max_observation_s']:.2f} s"
+        )
+    return world, detection
 
 
 async def run_stationary_grab(machine, config, *, execute=False, approach_only=False):
-    """Detect -> approach -> reacquire -> descend -> grab -> lift.
+    """Detect once, then approach and optionally grab using that world pose.
 
     Preview (default) reads sensors and returns targets. --execute runs one cycle.
+    Approach and grab both use the first localization; later camera loss is ignored.
     Requires exclusive arm control; concurrent calls in this process are rejected.
     """
     validate_config(config)
@@ -161,9 +157,10 @@ async def run_stationary_grab(machine, config, *, execute=False, approach_only=F
             _vector(_xyz(value.pose), 3, "gripper XYZ")
             return value.pose
 
-        async def move(point, *, linear=False):
+        async def move(point, *, linear=False, check_workspace=True):
             nonlocal commanded
-            _check_bounds(point, config)
+            if check_workspace:
+                _check_bounds(point, config)
             ox, oy, oz, theta = config["grasp_orientation"]
             target = PoseInFrame(reference_frame=config["world_frame"],
                                  pose=Pose(x=point[0], y=point[1], z=point[2],
@@ -187,40 +184,28 @@ async def run_stationary_grab(machine, config, *, execute=False, approach_only=F
 
         try:
             ball, detection = await _observe(machine, arm, config)
+            result.update(ball_world_mm=asdict(ball),
+                          midpoint_px=[detection.center_x, detection.center_y])
             targets = make_targets(ball, config)
             current = await current_pose()
-            _check_bounds(_xyz(current), config)
-            # Raise before crossing the table if the initial gripper is low.
+            # workspace_mm bounds pickup targets only. The observe/home TCP may be outside
+            # that table box; raising in place is allowed so the arm can then enter it.
             clearance = [current.x, current.y, max(current.z, targets["approach"][2])]
-            _check_bounds(clearance, config)
-            result.update(ball_world_mm=asdict(ball), midpoint_px=[detection.center_x, detection.center_y],
-                          targets_world_mm=targets, initial_clearance_world_mm=clearance,
+            result.update(targets_world_mm=targets, initial_clearance_world_mm=clearance,
+                          initial_gripper_world_mm=_xyz(current),
                           grasp_orientation=config["grasp_orientation"])
             if not execute:
                 return {**result, "success": True, "state": "preview"}
 
             state = "clearance"
             if current.z < clearance[2]-config["arrival_tolerance_mm"]:
-                await move(clearance)
+                await move(clearance, check_workspace=False)
             state = "approach"
             await move(targets["approach"])
             if approach_only:
                 return {**result, "success": True, "executed": True, "state": "approached"}
-            state = "reacquire"
-            fresh, _ = await _observe(machine, arm, config)
-            if math.dist(_xyz(fresh), _xyz(ball)) > config["max_reacquire_shift_mm"]:
-                raise ValueError("Ball moved or calibration changed after approach")
-            targets = make_targets(fresh, config)
-            result.update(ball_world_mm=asdict(fresh), targets_world_mm=targets)
-            state = "align"
-            await move(targets["approach"], linear=True)
-            # Open only once the approach has been checked; abort if camera loses ball.
             state = "open"
             await gripper.open(timeout=config["rpc_timeout_s"])
-            state = "verify_target"
-            final, _ = await _observe(machine, arm, config)
-            if math.dist(_xyz(final), _xyz(fresh)) > config["stationary_tolerance_mm"]:
-                raise ValueError("Ball shifted before descent")
             state = "descend"
             await move(targets["grasp"], linear=True)
             state = "grab"
