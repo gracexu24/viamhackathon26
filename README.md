@@ -364,3 +364,35 @@ The output is not itself a safe motion command: it has no arm reachability,
 collision, latency, or trajectory checks. For a catch, compare the arm reference
 against the ball position predicted at the catch time—not merely the ball's latest
 position.
+
+## Read-only two-camera yellow-ball predictor
+
+`motion/two_camera_rgb_local.py` is the current RGB-only catch predictor. It does
+not import or call the arm, motion service, gripper, depth, point clouds, or a
+vision segmenter. Run it on the Viam compute machine so both camera loops receive
+local capture-timestamped frames:
+
+```bash
+cd /opt/viam/trajectory-local
+/opt/viam/trajectory-local-venv/bin/python -m motion.two_camera_rgb_local \
+  --machine-config /root/.viam/cached_cloud_config_49d63d4f-4191-4d94-9e43-e379f846dd0e.json \
+  --side-camera cam2 --front-camera cam \
+  --catch-u-px 700 --basket-u-px 424 \
+  --duration 20
+```
+
+Replace `700` with the desired side-image catch column and `424` with the measured
+front-image basket center. Use `--front-camera cam1` if that is the actual front
+resource. The side fit estimates the future crossing timestamp; the front
+fit predicts ball U at that timestamp and prints signed error plus
+`LEFT`/`CENTER`/`RIGHT`. `--invert-lateral` swaps only the LEFT/RIGHT labels after
+a physical mapping check.
+
+Default yellow HSV thresholds use OpenCV ranges: H 18–40, S at least 90, and V at
+least 80. The detector returns multiple candidates; a constant-velocity pixel
+tracker associates the nearest plausible candidate and survives a 0.1 s gap
+without inserting fake observations.
+
+The side fit accepts either image direction. It emits a prediction only when the
+fitted crossing is in the future and within `--max-horizon-s`; a ball moving away
+from `catch_u_px` is therefore rejected.

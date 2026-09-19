@@ -70,7 +70,8 @@ The goal is to collect enough useful information from both cameras to predict a 
 - Moving a basket to that interception point.
 - Using the wrist camera as extra information to improve the target before the catch.
 - Keeping the basket open at all times.
-
+git restore --staged recitation2.txt
+git restore recitation2.tx
 ## We are not doing
 
 - ROS.

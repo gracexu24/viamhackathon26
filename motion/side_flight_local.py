@@ -1,4 +1,4 @@
-"""Capture cam2 ball flight on the Viam compute device; read-only, no arm motion.
+"""Capture cam2 yellow-ball flight on the Viam compute device; read-only.
 
 Requires the existing local machine config for loopback SDK authentication.
 Records fresh pixel observations as JSON Lines and predicts an image catch-line
@@ -14,8 +14,6 @@ from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
 
-import cv2
-import numpy as np
 from viam.components.camera import Camera
 from viam.robot.client import RobotClient
 
@@ -24,27 +22,7 @@ from motion.trajectory_fit import (
     fit_plane_ballistic, pixel_to_plane,
 )
 from motion.trajectory_local import credentials, decode_color, positive
-
-
-def red_ball_center(bgr, min_area_px=80):
-    """Return one red circular ball center, or None if missing/ambiguous."""
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (0, 100, 70), (10, 255, 255))
-    mask |= cv2.inRange(hsv, (170, 100, 70), (179, 255, 255))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    centers = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        perimeter = cv2.arcLength(contour, True)
-        if area < min_area_px or perimeter <= 0 or 4 * math.pi * area / perimeter**2 < 0.65:
-            continue
-        (u, v), radius = cv2.minEnclosingCircle(contour)
-        if u - radius <= 0 or v - radius <= 0 or u + radius >= bgr.shape[1] - 1 \
-                or v + radius >= bgr.shape[0] - 1:
-            continue
-        centers.append((float(u), float(v)))
-    return centers[0] if len(centers) == 1 else None
+from vision.yellow_ball import TemporalPixelTracker, detect_yellow_candidates
 
 
 async def run(args):
@@ -62,6 +40,8 @@ async def run(args):
         async with await RobotClient.at_address("127.0.0.1:8080", options) as robot:
             camera = Camera.from_robot(robot, args.camera)
             history = deque(maxlen=10)
+            tracker = TemporalPixelTracker(args.max_gap_s, args.association_gate_px)
+            track_id = tracker.track_id
             last_timestamp = None
             shot_id = 0
             started = report_at = time.monotonic()
@@ -84,18 +64,25 @@ async def run(args):
                     sources = {image.name: image for image in images}
                     if args.source not in sources:
                         raise ValueError(f"Source {args.source!r} missing; available: {list(sources)}")
-                    center = red_ball_center(decode_color(sources[args.source]), args.min_area_px)
-                    if center is None:
+                    detector_config = dict(
+                        hue_min=args.yellow_h_min, hue_max=args.yellow_h_max,
+                        saturation_min=args.yellow_s_min, value_min=args.yellow_v_min,
+                        min_area_px=args.min_area_px, min_circularity=args.min_circularity)
+                    measurement = tracker.update(timestamp, detect_yellow_candidates(
+                        decode_color(sources[args.source]), detector_config))
+                    if measurement is None:
                         counts["missed"] += 1
-                        if history:
-                            shot_id += 1
+                        if not tracker.is_active(timestamp) and history:
                             history.clear()
                     else:
                         counts["detected"] += 1
-                        if history and timestamp - history[-1].timestamp > args.max_gap_s:
-                            shot_id += 1
+                        if tracker.track_id != track_id:
+                            if track_id:
+                                shot_id += 1
                             history.clear()
-                        sample = PixelSample(timestamp, *center)
+                            track_id = tracker.track_id
+                        center = (measurement.u, measurement.v)
+                        sample = PixelSample(timestamp, measurement.u, measurement.v)
                         history.append(sample)
                         plane = pixel_to_plane(*center, homography) if homography is not None else None
                         if output is not None:
@@ -175,6 +162,12 @@ def main():
     parser.add_argument("--max-gap-s", type=positive, default=0.15)
     parser.add_argument("--max-fit-error-px", type=positive, default=8.0)
     parser.add_argument("--min-area-px", type=positive, default=80.0)
+    parser.add_argument("--min-circularity", type=positive, default=0.55)
+    parser.add_argument("--association-gate-px", type=positive, default=80.0)
+    parser.add_argument("--yellow-h-min", type=int, default=18)
+    parser.add_argument("--yellow-h-max", type=int, default=40)
+    parser.add_argument("--yellow-s-min", type=int, default=90)
+    parser.add_argument("--yellow-v-min", type=int, default=80)
     parser.add_argument("--max-horizon-s", type=positive, default=0.5)
     parser.add_argument("--catch-u-px", type=float, help="Measured catch-line column in cam2 pixels")
     parser.add_argument("--plane-calibration", type=Path,
