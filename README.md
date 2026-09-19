@@ -263,3 +263,104 @@ The installed camera config contains `fps: 60`. A local three-second probe on
 above. The tracker polls at up to 120 Hz to consume that 60 FPS stream, skips
 repeated/stale timestamps, and reports fresh-frame and successful-detection rates
 separately. It does not reconfigure the camera's capture rate.
+
+## Side-profile camera (`cam2`) red-ball tracking
+
+The side camera is an existing Viam resource. Check its color stream from the
+project directory, without moving the arm:
+
+```powershell
+.venv/Scripts/python.exe -m vision.live_ball --camera cam2 --probe
+.venv/Scripts/python.exe -m vision.side_tracker --camera cam2 --duration 10
+# Optional annotated preview on the laptop (Escape or q closes it):
+.venv/Scripts/python.exe -m vision.side_tracker --camera cam2 --display
+```
+
+The laptop/cloud path is for framing and diagnostics, not fast flight tracking:
+one check on 2026-09-18 delivered only 0.2–0.9 fresh frames/s with 1.5–2.6 s
+capture-to-receipt age. The tracker rejects frames older than 0.5 s by default.
+For real-time pixel tracking, use the existing on-robot install:
+
+```bash
+viam machines part shell --part 49d63d4f-4191-4d94-9e43-e379f846dd0e
+cd /opt/viam/trajectory-local
+./run.sh --camera cam2 --duration 10 --print-hz 3
+```
+
+The local `cam2` test returned about 59–60 fresh frames/s with no stale frames.
+It reports ball pixel position and velocity only when the red ball appears as
+one distinct circular contour. A hand touching/overlapping the ball can merge
+the red mask with skin and cause `No single red ball`; first test with the ball
+alone in view. No command above moves the arm or uses the 3D segmenter.
+
+### Record and fit a side-camera flight
+
+Run the flight tracker on the compute device so it receives the camera's 60 FPS
+stream rather than delayed cloud frames:
+
+```bash
+cd /opt/viam/trajectory-local
+/opt/viam/trajectory-local-venv/bin/python -m motion.side_flight_local \
+  --machine-config /root/.viam/cached_cloud_config_49d63d4f-4191-4d94-9e43-e379f846dd0e.json \
+  --camera cam2 --duration 15 --record /tmp/cam2-flight.jsonl
+```
+
+After measuring the image column at which the basket catches the ball, add for
+example `--catch-u-px 700`. The output fits horizontal image motion linearly and
+vertical image motion quadratically using camera capture timestamps, then reports
+the predicted crossing time and image height. It remains read-only.
+
+Because `cam2` is angled and perspective-projected, its pixel parabola is an
+image-space approximation for a constrained throw lane. Pixel acceleration is
+not gravity and pixels must not be passed to the arm as millimeters. The physical
+model in `motion/trajectory_fit.py` uses
+`p(t) = p0 + v0*t + 0.5*[0,0,-9810]*t^2`, but only accepts calibrated, Z-up world
+XYZ samples. Supplying those requires camera-to-world calibration plus depth or
+another independent view; the current side-camera tracker intentionally does not
+invent the missing depth.
+
+For throws constrained to one vertical plane, full 3D is unnecessary. Measure at
+least four non-collinear points in that physical plane, record their matching
+`cam2` pixels, and replace every placeholder in
+`side_camera_plane.example.json`. The mapping removes the camera's sideways
+angle and perspective within that plane. Copy the measured file to the compute
+device and run:
+
+```bash
+/opt/viam/trajectory-local-venv/bin/python -m motion.side_flight_local \
+  --machine-config /root/.viam/cached_cloud_config_49d63d4f-4191-4d94-9e43-e379f846dd0e.json \
+  --camera cam2 --plane-calibration /path/to/measured-plane.json \
+  --catch-x-mm 1800 --duration 15 --record /tmp/cam2-flight.jsonl
+```
+
+This reports physical plane `(X,Z)`, velocity, fit error, and predicted time and
+height at the catch line using `Z(t)=Z0+Vz*t-0.5*9810*t^2`. It is valid only while
+the ball stays close to the calibrated plane; substantial toward/away motion
+requires depth or a second calibrated view.
+
+### Read-only 3D ball-to-arm guidance logic
+
+`vision/relative_3d.py` contains perception and decision logic only; it imports no
+arm or motion client and cannot command hardware. From one aligned `cam2` frame it:
+
+1. detects the red ball and uses its depth plus measured radius to estimate the
+   ball center in camera XYZ;
+2. takes the robust median depth of a tracked arm/basket reference ROI and
+   deprojects its center into the same XYZ frame;
+3. calculates `ball_xyz - arm_reference_xyz`; and
+4. reports left/right, up/down, and toward/away recommendations outside configured
+   millimeter deadbands.
+
+Camera optical axes are X right, Y down, and Z away from the camera. Because the
+side camera is angled, those labels are camera-relative. Passing a calibrated
+camera-to-world rotation converts the difference to world-axis directions; its
+translation is unnecessary for a same-frame difference. The configured ROI must
+cover a visible solid reference or marker on the arm/basket. An ROI over the empty
+basket opening measures the background and is invalid. If that marker is offset
+from the true basket center, measure and account for that offset before any future
+motion layer uses the result.
+
+The output is not itself a safe motion command: it has no arm reachability,
+collision, latency, or trajectory checks. For a catch, compare the arm reference
+against the ball position predicted at the catch time—not merely the ball's latest
+position.
