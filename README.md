@@ -377,16 +377,18 @@ cd /opt/viam/trajectory-local
 /opt/viam/trajectory-local-venv/bin/python -m motion.two_camera_rgb_local \
   --machine-config /root/.viam/cached_cloud_config_49d63d4f-4191-4d94-9e43-e379f846dd0e.json \
   --side-camera cam2 --front-camera cam \
-  --catch-u-px 700 --basket-u-px 424 \
+  --catch-u-px "$CATCH_U_PX" \
+  --basket-u-px "$BASKET_U_PX" --basket-v-px "$BASKET_V_PX" \
   --duration 20
 ```
 
-Replace `700` with the desired side-image catch column and `424` with the measured
-front-image basket center. Use `--front-camera cam1` if that is the actual front
-resource. The side fit estimates the future crossing timestamp; the front
-fit predicts ball U at that timestamp and prints signed error plus
-`LEFT`/`CENTER`/`RIGHT`. `--invert-lateral` swaps only the LEFT/RIGHT labels after
-a physical mapping check.
+Set `CATCH_U_PX` to the desired measured side-image catch column, and set
+`BASKET_U_PX` and `BASKET_V_PX` to the measured front-image basket center. Use
+`--front-camera cam1` if that is the actual front resource. The
+side fit estimates the future crossing timestamp; the front fit predicts ball
+U and V at that exact timestamp and returns a structured `CatchPrediction` with
+both signed errors. `--invert-lateral` only affects the legacy LEFT/RIGHT label;
+Phase 3 uses its own calibrated axis signs.
 
 Default yellow HSV thresholds use OpenCV ranges: H 18–40, S at least 90, and V at
 least 80. The detector returns multiple candidates; a constant-velocity pixel
@@ -396,3 +398,46 @@ without inserting fake observations.
 The side fit accepts either image direction. It emits a prediction only when the
 fitted crossing is in the future and within `--max-horizon-s`; a ball moving away
 from `catch_u_px` is therefore rejected.
+
+## Phase 3: one-shot 2D basket movement in the catch plane
+
+`motion/intercept_controller.py` consumes one structured Phase 2 prediction and
+maps front-image horizontal and vertical error onto two configured UF850
+Cartesian axes. The third Cartesian coordinate is forced to the configured
+fixed catch-plane value, and basket orientation is copied unchanged from the
+verified catch-ready pose. Perception contains no arm calls.
+
+Copy `intercept_controller.config.example.json` to
+`intercept_controller.config.json` and replace every `null` with a physically
+measured value. The example is deliberately non-runnable: the actual axes,
+directions, scales, pose, bounds, and lead time must not be guessed.
+
+Integrated live dry run (the default):
+
+```bash
+cd /opt/viam/trajectory-local
+/opt/viam/trajectory-local-venv/bin/python -m motion.intercept_controller \
+  --config intercept_controller.config.json \
+  --machine-config /root/.viam/cached_cloud_config_49d63d4f-4191-4d94-9e43-e379f846dd0e.json \
+  --arm arm --side-camera cam2 --front-camera cam1 \
+  --catch-u-px "$CATCH_U_PX" \
+  --basket-u-px "$BASKET_U_PX" --basket-v-px "$BASKET_V_PX"
+```
+
+Add `--execute` only after dry-run and no-ball motion calibration. A live run
+commits the first sufficiently valid prediction, issues at most one
+`move_to_position`, arrives early, and holds. Restart the command for the next
+attempt. A saved synthetic/Phase 2 result can be tested without cameras using
+`--prediction-json phase2_prediction.json`.
+
+The controller validates prediction age and timing, both fit errors, independent
+deadbands, correction limits, rectangular in-plane bounds, fixed plane normal,
+fixed orientation, and arm idle state. A correction requiring clamping is shown
+by the pure mapping function but is rejected before live motion. Dry run never
+gets an arm resource. A failed movement is stopped and never retried.
+
+Calibration order: teach the catch-ready pose; jog each candidate Cartesian axis
+by a small known distance; identify image horizontal, image vertical, and the
+remaining plane-normal axis; measure direction and pixels traveled independently;
+then establish conservative in-plane bounds and minimum lead time. Test center,
+left, right, up, down, diagonal, and center again without a ball before live use.

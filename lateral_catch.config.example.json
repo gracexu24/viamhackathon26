@@ -1,0 +1,14 @@
+{
+  "arm": "arm",
+  "lateral_axis": "y",
+  "base_pose": null,
+  "mm_per_pixel": 1.0,
+  "max_lateral_move_mm": 80.0,
+  "lateral_min_mm": -80.0,
+  "lateral_max_mm": 80.0,
+  "minimum_lead_time_s": 0.50,
+  "max_prediction_age_s": 0.15,
+  "center_deadband_px": 25.0,
+  "robot_sign_for_positive_error": 1.0,
+  "rpc_timeout_s": 5.0
+}

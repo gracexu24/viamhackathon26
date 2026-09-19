@@ -82,6 +82,13 @@ class PredictionTests(unittest.TestCase):
         fit = fit_front_lateral(samples)
         self.assertAlmostEqual(fit.predict_u(.3), 336, places=5)
 
+    def test_front_linear_fit_predicts_u_and_v_at_same_timestamp(self):
+        samples = [FrontSample(i*.03, 300+120*i*.03, 220-80*i*.03)
+                   for i in range(5)]
+        fit = fit_front_lateral(samples)
+        self.assertAlmostEqual(fit.predict_u(.3), 336, places=5)
+        self.assertAlmostEqual(fit.predict_v(.3), 196, places=5)
+
     def test_left_of_basket_returns_left(self):
         self.assertEqual(lateral_decision(-30, 10), "LEFT")
 
@@ -104,6 +111,18 @@ class PredictionTests(unittest.TestCase):
         self.assertAlmostEqual(prediction.predicted_ball_u_at_catch, 320, places=5)
         self.assertAlmostEqual(prediction.lateral_error_px, 20, places=5)
         self.assertEqual(prediction.decision, "RIGHT")
+
+    def test_combined_prediction_contains_vertical_error(self):
+        side_samples = [PixelSample(i*.02, 100+400*i*.02, 200) for i in range(7)]
+        side = runtime.predict_side_catch(side_samples, 180, .5, 8)
+        samples = [FrontSample(i*.03, 300+100*i*.03, 200+50*i*.03)
+                   for i in range(5)]
+        fit = fit_front_lateral(samples)
+        prediction = runtime.combine_prediction(
+            side, len(samples), fit, 300, 10, basket_v_px=190,
+            vertical_deadband_px=10)
+        self.assertAlmostEqual(prediction.predicted_front_v_at_catch, 210, places=5)
+        self.assertAlmostEqual(prediction.vertical_error_px, 20, places=5)
 
     def test_runtime_contains_no_robot_motion_api(self):
         source = inspect.getsource(runtime)

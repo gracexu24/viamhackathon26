@@ -979,3 +979,60 @@ without requiring perfect continuous 3D control.
 The system only has to classify the predicted interception into one of a small number of basket locations.
 
 That should be preferred over adding sophisticated control code if the continuous target approach is unstable.
+
+---
+
+# Phase 3 Update — One-Shot 2D Catch-Plane Basket Movement
+
+Phase 3 consumes the Phase 2 structured prediction directly. Yellow-ball
+detection and cam2 catch-time prediction remain unchanged. The only Phase 2
+extension is a front-camera V fit evaluated at the same cam2 catch timestamp as U.
+
+## Motion contract
+
+`motion/intercept_controller.py` accepts:
+
+```text
+prediction_timestamp
+catch_timestamp
+time_to_catch_s
+predicted_front_u_at_catch / predicted_front_v_at_catch
+basket_u_px / basket_v_px
+horizontal_error_px / vertical_error_px
+side_fit_rms_px / front_fit_rms_px
+```
+
+It validates lead time, freshness, fit quality, arm idle state, maximum
+corrections, and configured two-dimensional bounds. It maps independently:
+
+```text
+horizontal_move_mm = horizontal_error_px * horizontal_mm_per_pixel * configured_sign
+vertical_move_mm   = vertical_error_px   * vertical_mm_per_pixel   * configured_sign
+```
+
+Each result has its own deadband and clamp. A live command is rejected if a raw
+correction exceeds either clamp. The two safe corrections are applied to the
+two configured in-plane axes of a measured catch-ready pose. The configured
+plane-normal coordinate and all four orientation values remain fixed.
+
+All three axes and both signs are configurable. The example config contains
+`null` for every physical calibration value, including the catch-ready pose, so
+it cannot be mistaken for a safe machine-specific configuration.
+
+## Safety and execution
+
+Dry-run is the default. `--execute` is required for physical motion. A valid
+prediction produces one arm command, then leaves the basket at the target to
+hold through the catch time. Two-dimensional CENTER produces no command. Insufficient lead time
+prints `insufficient_lead_time`; stale, invalid, unsafe, or already-moving
+conditions abort without motion. A failed move is stopped once and never retried.
+
+## Testing order
+
+1. Run unit tests for both pixel-to-mm mappings, signs, independent deadbands, clamps, bounds, stale/lead-time rejection, and dry-run.
+2. Run the controller on the Viam compute machine in dry-run mode with a saved Phase 2 prediction.
+3. Measure the catch-ready pose, two in-plane axes/signs, fixed normal, two pixel scales, safe bounds, and minimum lead time.
+4. Execute small manual LEFT/RIGHT/UP/DOWN/diagonal moves with no ball.
+5. Only then connect live Phase 2 predictions.
+
+Continuous correction, wrist-camera feedback, depth, ML, and streamed servo control remain out of scope.

@@ -1,8 +1,9 @@
-"""Read-only two-camera yellow-ball catch predictor; never moves hardware.
+"""Two-camera yellow-ball catch predictor; this module never moves hardware.
 
 cam2 predicts when the ball crosses a configured side-image column. The front
-camera predicts horizontal ball position at that same capture timestamp and
-reports LEFT/CENTER/RIGHT relative to a configured basket-center pixel.
+camera predicts the ball's (u, v) position at that same capture timestamp.
+An optional structured-result handler lets a separate motion module consume one
+prediction without coupling arm control into perception.
 """
 
 import argparse
@@ -37,6 +38,8 @@ class SideCatchPrediction:
 
 @dataclass(frozen=True)
 class CatchPrediction:
+    valid: bool
+    prediction_timestamp: float
     catch_timestamp: float
     time_to_catch_s: float
     side_samples: int
@@ -45,16 +48,32 @@ class CatchPrediction:
     front_samples: int
     front_fit_rms_px: float
     front_velocity_u_px_s: float
-    predicted_ball_u_at_catch: float
+    front_velocity_v_px_s: float
+    predicted_front_u_at_catch: float
+    predicted_front_v_at_catch: float
     basket_u_px: float
-    lateral_error_px: float
+    basket_v_px: float
+    horizontal_error_px: float
+    vertical_error_px: float
     decision: str
+    vertical_decision: str
+
+    # Backward-compatible names used by the completed horizontal Phase 2 tests.
+    @property
+    def predicted_ball_u_at_catch(self):
+        return self.predicted_front_u_at_catch
+
+    @property
+    def lateral_error_px(self):
+        return self.horizontal_error_px
 
 
 @dataclass
 class SharedState:
     side_catch: SideCatchPrediction | None = None
     stopped: bool = False
+    committed: bool = False
+    result: object = None
 
 
 def captured_at_seconds(metadata):
@@ -81,14 +100,18 @@ def predict_side_catch(samples, catch_u_px, max_horizon_s, max_fit_error_px):
 
 
 def combine_prediction(side_catch, front_samples, front_fit, basket_u_px,
-                       center_deadband_px, invert_lateral=False):
+                       center_deadband_px, invert_lateral=False, *,
+                       basket_v_px=0.0, vertical_deadband_px=0.0):
     """Evaluate the front fit at the side-camera crossing timestamp."""
     time_to_catch = side_catch.catch_timestamp - front_fit.timestamp
     if time_to_catch < 0:
         raise ValueError("Catch timestamp is behind the front-camera track")
-    predicted_u = front_fit.predict_u(side_catch.catch_timestamp)
-    error = predicted_u - float(basket_u_px)
+    predicted_u, predicted_v = front_fit.predict(side_catch.catch_timestamp)
+    horizontal_error = predicted_u - float(basket_u_px)
+    vertical_error = predicted_v - float(basket_v_px)
     return CatchPrediction(
+        valid=True,
+        prediction_timestamp=front_fit.timestamp,
         catch_timestamp=side_catch.catch_timestamp,
         time_to_catch_s=time_to_catch,
         side_samples=side_catch.side_samples,
@@ -97,10 +120,16 @@ def combine_prediction(side_catch, front_samples, front_fit, basket_u_px,
         front_samples=int(front_samples),
         front_fit_rms_px=front_fit.rms_error_px,
         front_velocity_u_px_s=front_fit.du_px_s,
-        predicted_ball_u_at_catch=predicted_u,
+        front_velocity_v_px_s=front_fit.dv_px_s,
+        predicted_front_u_at_catch=predicted_u,
+        predicted_front_v_at_catch=predicted_v,
         basket_u_px=float(basket_u_px),
-        lateral_error_px=error,
-        decision=lateral_decision(error, center_deadband_px, invert_lateral),
+        basket_v_px=float(basket_v_px),
+        horizontal_error_px=horizontal_error,
+        vertical_error_px=vertical_error,
+        decision=lateral_decision(horizontal_error, center_deadband_px, invert_lateral),
+        vertical_decision=("CENTER" if abs(vertical_error) <= vertical_deadband_px
+                           else "UP" if vertical_error < 0 else "DOWN"),
     )
 
 
@@ -150,7 +179,7 @@ async def side_loop(camera, args, detector_config, shared):
         await asyncio.sleep(max(0, next_poll-time.monotonic()))
 
 
-async def front_loop(camera, args, detector_config, shared):
+async def front_loop(camera, args, detector_config, shared, on_prediction=None):
     tracker = TemporalPixelTracker(args.max_gap_s, args.association_gate_px)
     history = deque(maxlen=max(12, args.min_front_samples * 2))
     track_id = tracker.track_id
@@ -181,7 +210,7 @@ async def front_loop(camera, args, detector_config, shared):
             if tracker.track_id != track_id:
                 history.clear()
                 track_id = tracker.track_id
-            history.append(FrontSample(measurement.timestamp, measurement.u))
+            history.append(FrontSample(measurement.timestamp, measurement.u, measurement.v))
         elif not tracker.is_active(timestamp):
             history.clear()
         side_catch = shared.side_catch
@@ -197,7 +226,9 @@ async def front_loop(camera, args, detector_config, shared):
                     raise ValueError("Front prediction horizon is invalid")
                 prediction = combine_prediction(
                     side_catch, len(history), fit, args.basket_u_px,
-                    args.center_deadband_px, args.invert_lateral)
+                    args.center_deadband_px, args.invert_lateral,
+                    basket_v_px=args.basket_v_px,
+                    vertical_deadband_px=args.vertical_deadband_px)
                 if time.monotonic()-last_print >= 1/args.print_hz:
                     print(
                         f"side_samples={prediction.side_samples} "
@@ -207,19 +238,26 @@ async def front_loop(camera, args, detector_config, shared):
                         f"catch_in={prediction.time_to_catch_s:.3f}s | "
                         f"front_samples={prediction.front_samples} "
                         f"front_vu={prediction.front_velocity_u_px_s:+.1f}px/s "
+                        f"front_vv={prediction.front_velocity_v_px_s:+.1f}px/s "
                         f"front_rms={prediction.front_fit_rms_px:.1f}px "
-                        f"predicted_u={prediction.predicted_ball_u_at_catch:.1f}px "
-                        f"basket_u={prediction.basket_u_px:.1f}px "
-                        f"error={prediction.lateral_error_px:+.1f}px "
+                        f"predicted=({prediction.predicted_front_u_at_catch:.1f},"
+                        f"{prediction.predicted_front_v_at_catch:.1f})px "
+                        f"basket=({prediction.basket_u_px:.1f},{prediction.basket_v_px:.1f})px "
+                        f"error=({prediction.horizontal_error_px:+.1f},"
+                        f"{prediction.vertical_error_px:+.1f})px "
                         f"decision={prediction.decision}", flush=True)
                     last_print = time.monotonic()
+                if on_prediction is not None and not shared.committed:
+                    shared.committed = True
+                    shared.result = await on_prediction(prediction)
+                    shared.stopped = True
             except ValueError:
                 pass
         next_poll = max(next_poll + 1/args.poll_hz, time.monotonic())
         await asyncio.sleep(max(0, next_poll-time.monotonic()))
 
 
-async def run(args):
+async def run(args, prediction_handler=None):
     key_id, key = credentials(args.machine_config)
     options = RobotClient.Options.with_api_key(api_key=key, api_key_id=key_id)
     options.dial_options.disable_webrtc = True
@@ -236,10 +274,19 @@ async def run(args):
     async with await RobotClient.at_address("127.0.0.1:8080", options) as robot:
         side = Camera.from_robot(robot, args.side_camera)
         front = Camera.from_robot(robot, args.front_camera)
-        print(f"Read-only RGB predictor: side={args.side_camera!r} "
-              f"front={args.front_camera!r}; no robot motion.", flush=True)
+        if prediction_handler is None:
+            print(f"Read-only RGB predictor: side={args.side_camera!r} "
+                  f"front={args.front_camera!r}; no robot motion.", flush=True)
+        else:
+            print(f"RGB predictor: side={args.side_camera!r} front={args.front_camera!r}; "
+                  "first valid prediction will be passed to the one-shot handler.", flush=True)
+        async def handle(prediction):
+            return await prediction_handler(robot, prediction)
+
         tasks = [asyncio.create_task(side_loop(side, args, detector_config, shared)),
-                 asyncio.create_task(front_loop(front, args, detector_config, shared))]
+                 asyncio.create_task(front_loop(
+                     front, args, detector_config, shared,
+                     handle if prediction_handler is not None else None))]
         try:
             if args.duration is None:
                 await asyncio.gather(*tasks)
@@ -252,6 +299,7 @@ async def run(args):
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+    return shared.result
 
 
 def main():
@@ -262,7 +310,9 @@ def main():
     parser.add_argument("--color-source", default="color")
     parser.add_argument("--catch-u-px", type=float, required=True)
     parser.add_argument("--basket-u-px", type=float, required=True)
+    parser.add_argument("--basket-v-px", type=float, required=True)
     parser.add_argument("--center-deadband-px", type=positive, default=25.0)
+    parser.add_argument("--vertical-deadband-px", type=positive, default=25.0)
     parser.add_argument("--min-side-samples", type=int, default=7)
     parser.add_argument("--min-front-samples", type=int, default=5)
     parser.add_argument("--max-gap-s", type=positive, default=0.1)
@@ -288,7 +338,8 @@ def main():
         parser.error("--min-side-samples must be at least 5")
     if args.min_front_samples < 2:
         parser.error("--min-front-samples must be at least 2")
-    if not all(math.isfinite(value) for value in (args.catch_u_px, args.basket_u_px)):
+    if not all(math.isfinite(value) for value in
+               (args.catch_u_px, args.basket_u_px, args.basket_v_px)):
         parser.error("Catch and basket pixels must be finite")
     try:
         asyncio.run(run(args))
