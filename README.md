@@ -85,22 +85,11 @@ Transform a known cam2-frame 3D point from the command line with:
 python -m vision.transforms --config cam2_transform.json --point X Y Z
 ```
 
-If `cam2` supplies depth aligned to its color stream, the local red-ball
-diagnostic can emit world-frame points and velocities directly:
-
-```bash
-python -m motion.trajectory_local \
-  --machine-config /path/to/cached-machine-config.json \
-  --camera cam2 \
-  --aligned-depth \
-  --transform-config cam2_transform.json
-```
-
 The same file contains a `viam_frame` block using a quaternion. Add that block
 to the `cam2` component's Frame configuration in Viam with parent `world`; then
-`machine.transform_pose(...)` can use the calibration throughout the camera,
-arm, gripper, and motion code. Verify it against several physically measured
-world points before enabling any motion.
+future 3D code can use `machine.transform_pose(...)` instead of maintaining a
+second transform chain. Verify it against several physically measured world
+points before enabling any motion.
 
 The two-camera predictor remains pixel-only and therefore does not consume this
 4x4 transform. A pixel is a ray, not a 3D point: it also needs aligned depth or a
@@ -120,17 +109,11 @@ calibrated intersection with the throw plane before the extrinsic can be applied
 | --- | --- |
 | `motion/trajectory_fit.py` | Pixel-, plane-, and world-space trajectory models and fitting helpers. |
 | `motion/side_flight_local.py` | Read-only side-camera flight tracking and plane calibration. |
-| `motion/trajectory_local.py` | Shared local tracking helpers and diagnostic trajectory runner. |
 | `vision/yellow_ball.py` | Yellow-ball detection and temporal pixel tracking. |
-| `vision/side_tracker.py` | Side-camera tracking diagnostics. |
-| `vision/relative_3d.py` | Relative 3D camera diagnostics. |
+| `vision/local_camera.py` | Shared read-only camera connection and decoding helpers. |
 | `vision/transforms.py` | Validated absolute-point and relative-vector rigid transforms. |
-| `motion/viam_stationary_grab.py` | Earlier stationary-object grab workflow retained for reference. |
-| `motion/viam_ball_catch.py` | Earlier Viam-native catch experiment retained for reference. |
 
-Detailed design notes are in `SCOPED_TWO_CAMERA_BASKET_CATCH.md`. Older scoped
-notes and configuration examples remain where they are still useful to tested
-diagnostic or reference workflows.
+Detailed design notes are in `SCOPED_TWO_CAMERA_BASKET_CATCH.md`.
 
 ## Tests
 
@@ -140,14 +123,12 @@ Run the complete unit-test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The live desktop preview and its two import-level tests require a Python
-installation with Tk support. Headless perception and trajectory-fitting tests
-do not require a display.
+The test suite is headless and does not require a display or robot connection.
 
 ## Project layout
 
 ```text
-motion/       trajectory fitting, prediction, and legacy Viam motion workflows
+motion/       yellow-ball trajectory fitting and prediction
 vision/       camera detection and diagnostic utilities
 tests/        unit tests with mocked Viam hardware
 *.json        calibration examples and measured transforms
