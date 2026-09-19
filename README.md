@@ -70,6 +70,42 @@ at that same capture timestamp. The final output reports `LEFT`, `CENTER`, or
 `RIGHT` relative to the configured basket center. Camera names and thresholds
 can be adjusted with `python -m motion.two_camera_rgb_local --help`.
 
+## Coordinate transforms
+
+The measured fixed-camera calibration is stored in `cam2_transform.json` as
+`T_world_from_cam2`, using the convention:
+
+```text
+p_world = T_world_from_cam2 @ [x_cam2, y_cam2, z_cam2, 1]
+```
+
+Transform a known cam2-frame 3D point from the command line with:
+
+```bash
+python -m vision.transforms --config cam2_transform.json --point X Y Z
+```
+
+If `cam2` supplies depth aligned to its color stream, the local red-ball
+diagnostic can emit world-frame points and velocities directly:
+
+```bash
+python -m motion.trajectory_local \
+  --machine-config /path/to/cached-machine-config.json \
+  --camera cam2 \
+  --aligned-depth \
+  --transform-config cam2_transform.json
+```
+
+The same file contains a `viam_frame` block using a quaternion. Add that block
+to the `cam2` component's Frame configuration in Viam with parent `world`; then
+`machine.transform_pose(...)` can use the calibration throughout the camera,
+arm, gripper, and motion code. Verify it against several physically measured
+world points before enabling any motion.
+
+The two-camera predictor remains pixel-only and therefore does not consume this
+4x4 transform. A pixel is a ray, not a 3D point: it also needs aligned depth or a
+calibrated intersection with the throw plane before the extrinsic can be applied.
+
 ## Safety and limitations
 
 - The current two-camera command is prediction-only; it does not move hardware.
@@ -88,6 +124,7 @@ can be adjusted with `python -m motion.two_camera_rgb_local --help`.
 | `vision/yellow_ball.py` | Yellow-ball detection and temporal pixel tracking. |
 | `vision/side_tracker.py` | Side-camera tracking diagnostics. |
 | `vision/relative_3d.py` | Relative 3D camera diagnostics. |
+| `vision/transforms.py` | Validated absolute-point and relative-vector rigid transforms. |
 | `motion/viam_stationary_grab.py` | Earlier stationary-object grab workflow retained for reference. |
 | `motion/viam_ball_catch.py` | Earlier Viam-native catch experiment retained for reference. |
 
@@ -113,6 +150,6 @@ do not require a display.
 motion/       trajectory fitting, prediction, and legacy Viam motion workflows
 vision/       camera detection and diagnostic utilities
 tests/        unit tests with mocked Viam hardware
-*.json        calibration examples
+*.json        calibration examples and measured transforms
 connection.py shared Viam connection helpers
 ```

@@ -1,7 +1,9 @@
 """Track red-ball pixels from the existing Viam camera on the part machine.
 
 Optional --aligned-depth adds camera-frame XYZ when depth is aligned to color.
-This entry point never commands motion or calls the remote object segmenter.
+With --transform-config, those 3D observations are converted to the calibrated
+destination frame. This entry point never commands motion or calls the remote
+object segmenter.
 """
 import argparse
 import asyncio
@@ -17,6 +19,7 @@ from viam.components.camera import Camera
 from viam.robot.client import RobotClient
 
 from ball_tracking import detect_red_ball
+from vision.transforms import load_transform
 
 
 def positive(value):
@@ -72,6 +75,10 @@ async def run(args):
     options = RobotClient.Options.with_api_key(api_key=key, api_key_id=key_id)
     options.dial_options.disable_webrtc = True
     options.dial_options.timeout = 10
+    transform = load_transform(args.transform_config) if args.transform_config else None
+    if transform is not None and transform.source_frame != args.camera:
+        raise ValueError(
+            f'Transform source frame {transform.source_frame!r} does not match camera {args.camera!r}')
     # The inspected part serves TLS on loopback port 8080.
     async with await RobotClient.at_address('127.0.0.1:8080', options) as robot:
         camera = Camera.from_robot(robot, args.camera)
@@ -83,10 +90,14 @@ async def run(args):
                               fx=p.focal_x_px, fy=p.focal_y_px,
                               cx=p.center_x_px, cy=p.center_y_px)
         print('Local Viam camera tracker; Ctrl+C to stop. No robot motion.', flush=True)
-        print('XYZ: camera optical frame (X right, Y down, Z forward).'
-              if args.aligned_depth else
-              'Pixel tracking only; --aligned-depth enables XYZ after alignment is verified.',
-              flush=True)
+        if transform is not None:
+            print(f'XYZ: {transform.destination_frame} frame in millimeters, transformed from '
+                  f'{transform.source_frame}.', flush=True)
+        else:
+            print('XYZ: camera optical frame (X right, Y down, Z forward).'
+                  if args.aligned_depth else
+                  'Pixel tracking only; --aligned-depth enables XYZ after alignment is verified.',
+                  flush=True)
         last_timestamp = None
         previous = None
         last_print = 0.0
@@ -119,7 +130,8 @@ async def run(args):
                     depth = np.asarray(sources[args.depth_source].bytes_to_depth_array(), dtype=float)
                     obs = detect_red_ball(bgr, depth, intrinsics, args.radius_mm, timestamp)
                     if obs is not None:
-                        point = obs.xyz / 1000
+                        point = (np.asarray(transform.point(obs.xyz)) if transform is not None
+                                 else obs.xyz / 1000)
                 else:
                     point = red_center(bgr)
                 if point is None:
@@ -133,8 +145,9 @@ async def run(args):
                         if 1e-6 < dt <= .25:
                             velocity = (point - previous[1]) / dt
                     previous = (timestamp, point)
-                    units = 'm' if args.aligned_depth else 'px'
-                    axes = 'camera XYZ' if args.aligned_depth else 'pixel UV'
+                    units = ('mm' if transform is not None else 'm') if args.aligned_depth else 'px'
+                    axes = (f'{transform.destination_frame} XYZ' if transform is not None else
+                            'camera XYZ') if args.aligned_depth else 'pixel UV'
                     status = f'{axes}={np.round(point, 3).tolist()} {units}'
                     if velocity is not None:
                         status += f' | velocity={np.round(velocity, 3).tolist()} {units}/s'
@@ -171,9 +184,13 @@ def main():
                         help='Stop after this many seconds; default runs until Ctrl+C')
     parser.add_argument('--aligned-depth', action='store_true',
                         help='Use XYZ only if returned depth is aligned to color and intrinsics describe color')
+    parser.add_argument('--transform-config', type=Path,
+                        help='Rigid camera-to-world JSON; requires --aligned-depth')
     parser.add_argument('--radius-mm', type=positive, default=20,
                         help='Measured ball radius for XYZ estimation (default 20 mm)')
     args = parser.parse_args()
+    if args.transform_config and not args.aligned_depth:
+        parser.error('--transform-config requires --aligned-depth')
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
