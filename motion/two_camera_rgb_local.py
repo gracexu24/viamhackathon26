@@ -1,0 +1,401 @@
+"""Two-camera yellow-ball catch predictor; this module never moves hardware.
+
+cam2 predicts when the ball crosses a configured side-image column. The front
+camera predicts the ball's (u, v) position at that same capture timestamp.
+An optional structured-result handler lets a separate motion module consume one
+prediction without coupling arm control into perception.
+"""
+
+import argparse
+import asyncio
+import math
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+
+from viam.components.camera import Camera
+from viam.robot.client import RobotClient
+
+from motion.trajectory_fit import (
+    FrontSample, PixelSample, fit_front_lateral, fit_pixel_flight, lateral_decision,
+)
+from vision.local_camera import credentials, decode_color, positive
+from vision.yellow_ball import (
+    BallReleaseDetector, TemporalPixelTracker, detect_yellow_candidates,
+)
+
+
+@dataclass(frozen=True)
+class SideCatchPrediction:
+    catch_timestamp: float
+    side_timestamp: float
+    side_samples: int
+    side_u: float
+    side_v: float
+    side_velocity_u_px_s: float
+    side_rms_px: float
+    side_catch_v_px: float
+
+
+@dataclass(frozen=True)
+class CatchPrediction:
+    valid: bool
+    prediction_timestamp: float
+    catch_timestamp: float
+    time_to_catch_s: float
+    side_samples: int
+    side_fit_rms_px: float
+    side_velocity_u_px_s: float
+    front_samples: int
+    front_fit_rms_px: float
+    front_velocity_u_px_s: float
+    front_velocity_v_px_s: float
+    predicted_front_u_at_catch: float
+    predicted_front_v_at_catch: float
+    basket_u_px: float
+    basket_v_px: float
+    horizontal_error_px: float
+    vertical_error_px: float
+    decision: str
+    vertical_decision: str
+
+    # Backward-compatible names used by the completed horizontal Phase 2 tests.
+    @property
+    def predicted_ball_u_at_catch(self):
+        return self.predicted_front_u_at_catch
+
+    @property
+    def lateral_error_px(self):
+        return self.horizontal_error_px
+
+
+@dataclass
+class SharedState:
+    side_catch: SideCatchPrediction | None = None
+    release_id: int = 0
+    release_timestamp: float | None = None
+    released: bool = False
+    stopped: bool = False
+    committed: bool = False
+    result: object = None
+
+
+def captured_at_seconds(metadata):
+    value = metadata.captured_at
+    return value.seconds + value.nanos / 1e9
+
+
+def predict_side_catch(samples, catch_u_px, max_horizon_s, max_fit_error_px):
+    """Fit real side samples and return their next crossing of catch_u_px."""
+    fit = fit_pixel_flight(samples, max_error_px=max_fit_error_px)
+    catch_timestamp, catch_v = fit.crossing(catch_u_px, max_horizon_s)
+    if catch_timestamp <= samples[-1].timestamp:
+        raise ValueError("Side crossing is not in the future")
+    return SideCatchPrediction(
+        catch_timestamp=catch_timestamp,
+        side_timestamp=float(samples[-1].timestamp),
+        side_samples=len(samples),
+        side_u=float(samples[-1].u),
+        side_v=float(samples[-1].v),
+        side_velocity_u_px_s=fit.du_px_s,
+        side_rms_px=fit.rms_error_px,
+        side_catch_v_px=catch_v,
+    )
+
+
+def combine_prediction(side_catch, front_samples, front_fit, basket_u_px,
+                       center_deadband_px, invert_lateral=False, *,
+                       basket_v_px=0.0, vertical_deadband_px=0.0):
+    """Evaluate the front fit at the side-camera crossing timestamp."""
+    time_to_catch = side_catch.catch_timestamp - front_fit.timestamp
+    if time_to_catch < 0:
+        raise ValueError("Catch timestamp is behind the front-camera track")
+    predicted_u, predicted_v = front_fit.predict(side_catch.catch_timestamp)
+    horizontal_error = predicted_u - float(basket_u_px)
+    vertical_error = predicted_v - float(basket_v_px)
+    return CatchPrediction(
+        valid=True,
+        prediction_timestamp=front_fit.timestamp,
+        catch_timestamp=side_catch.catch_timestamp,
+        time_to_catch_s=time_to_catch,
+        side_samples=side_catch.side_samples,
+        side_fit_rms_px=side_catch.side_rms_px,
+        side_velocity_u_px_s=side_catch.side_velocity_u_px_s,
+        front_samples=int(front_samples),
+        front_fit_rms_px=front_fit.rms_error_px,
+        front_velocity_u_px_s=front_fit.du_px_s,
+        front_velocity_v_px_s=front_fit.dv_px_s,
+        predicted_front_u_at_catch=predicted_u,
+        predicted_front_v_at_catch=predicted_v,
+        basket_u_px=float(basket_u_px),
+        basket_v_px=float(basket_v_px),
+        horizontal_error_px=horizontal_error,
+        vertical_error_px=vertical_error,
+        decision=lateral_decision(horizontal_error, center_deadband_px, invert_lateral),
+        vertical_decision=("CENTER" if abs(vertical_error) <= vertical_deadband_px
+                           else "UP" if vertical_error < 0 else "DOWN"),
+    )
+
+
+async def side_loop(camera, args, detector_config, shared):
+    tracker = TemporalPixelTracker(args.max_gap_s, args.association_gate_px)
+    release_detector = BallReleaseDetector(
+        args.held_speed_threshold_px_s,
+        args.release_speed_threshold_px_s,
+        args.release_min_consecutive_frames,
+        args.held_min_duration_s,
+    )
+    history = deque(maxlen=max(12, args.min_side_samples * 2))
+    track_id = tracker.track_id
+    last_timestamp = None
+    reported_ready = False
+    next_poll = time.monotonic()
+    while not shared.stopped:
+        images, metadata = await camera.get_images(timeout=5)
+        timestamp = captured_at_seconds(metadata)
+        age = time.time() - timestamp
+        if last_timestamp is not None and timestamp <= last_timestamp:
+            await asyncio.sleep(0)
+            continue
+        last_timestamp = timestamp
+        sources = {image.name: image for image in images}
+        if args.color_source not in sources:
+            raise ValueError(f"Side color source missing; available: {list(sources)}")
+        color = decode_color(sources[args.color_source])
+        if not reported_ready:
+            print(f"side camera ready: shape={color.shape[1]}x{color.shape[0]} "
+                  f"capture_age={age:.3f}s", flush=True)
+            reported_ready = True
+        candidates = [] if not 0 <= age <= args.max_age_s else detect_yellow_candidates(
+            color, detector_config)
+        measurement = tracker.update(timestamp, candidates)
+        if measurement is not None:
+            if tracker.track_id != track_id:
+                history.clear()
+                release_detector.reset()
+                shared.released = False
+                shared.release_timestamp = None
+                shared.side_catch = None
+                track_id = tracker.track_id
+            release = release_detector.update(measurement)
+            if release is not None:
+                history.clear()
+                history.extend(PixelSample(item.timestamp, item.u, item.v)
+                               for item in release.flight_measurements)
+                shared.release_id = release.release_id
+                shared.release_timestamp = release.timestamp
+                shared.released = True
+                print(f"release_detected t={release.timestamp:.3f} "
+                      f"speed={release.speed_px_s:.1f}px/s "
+                      f"release_id={release.release_id}", flush=True)
+            elif release_detector.released:
+                history.append(PixelSample(
+                    measurement.timestamp, measurement.u, measurement.v))
+            shared.side_catch = None
+            if shared.released and len(history) >= args.min_side_samples:
+                try:
+                    shared.side_catch = predict_side_catch(
+                        history, args.catch_u_px, args.max_horizon_s,
+                        args.max_side_fit_error_px)
+                except ValueError:
+                    shared.side_catch = None
+        elif not tracker.is_active(timestamp):
+            history.clear()
+            release_detector.reset()
+            shared.released = False
+            shared.release_timestamp = None
+            shared.side_catch = None
+        next_poll = max(next_poll + 1/args.poll_hz, time.monotonic())
+        await asyncio.sleep(max(0, next_poll-time.monotonic()))
+
+
+async def front_loop(camera, args, detector_config, shared, on_prediction=None):
+    tracker = TemporalPixelTracker(args.max_gap_s, args.association_gate_px)
+    history = deque(maxlen=max(12, args.min_front_samples * 2))
+    track_id = tracker.track_id
+    release_id = shared.release_id
+    last_timestamp = None
+    reported_ready = False
+    last_print = float("-inf")
+    next_poll = time.monotonic()
+    while not shared.stopped:
+        images, metadata = await camera.get_images(timeout=5)
+        timestamp = captured_at_seconds(metadata)
+        age = time.time() - timestamp
+        if last_timestamp is not None and timestamp <= last_timestamp:
+            await asyncio.sleep(0)
+            continue
+        last_timestamp = timestamp
+        sources = {image.name: image for image in images}
+        if args.color_source not in sources:
+            raise ValueError(f"Front color source missing; available: {list(sources)}")
+        color = decode_color(sources[args.color_source])
+        if not reported_ready:
+            print(f"front camera ready: shape={color.shape[1]}x{color.shape[0]} "
+                  f"capture_age={age:.3f}s", flush=True)
+            reported_ready = True
+        candidates = [] if not 0 <= age <= args.max_age_s else detect_yellow_candidates(
+            color, detector_config)
+        measurement = tracker.update(timestamp, candidates)
+        if measurement is not None:
+            if tracker.track_id != track_id:
+                history.clear()
+                track_id = tracker.track_id
+            if shared.release_id != release_id:
+                history.clear()
+                release_id = shared.release_id
+            if (shared.released and shared.release_timestamp is not None
+                    and measurement.timestamp >= shared.release_timestamp):
+                history.append(FrontSample(
+                    measurement.timestamp, measurement.u, measurement.v))
+        elif not tracker.is_active(timestamp):
+            history.clear()
+        if not shared.released:
+            history.clear()
+        side_catch = shared.side_catch
+        if side_catch is not None and side_catch.catch_timestamp <= timestamp:
+            shared.side_catch = None
+            side_catch = None
+        if side_catch is not None and len(history) >= args.min_front_samples:
+            try:
+                fit = fit_front_lateral(history, min_samples=args.min_front_samples,
+                                        max_error_px=args.max_front_fit_error_px)
+                prediction_horizon = side_catch.catch_timestamp - fit.timestamp
+                if not 0 <= prediction_horizon <= args.max_horizon_s:
+                    raise ValueError("Front prediction horizon is invalid")
+                prediction = combine_prediction(
+                    side_catch, len(history), fit, args.basket_u_px,
+                    args.center_deadband_px, args.invert_lateral,
+                    basket_v_px=args.basket_v_px,
+                    vertical_deadband_px=args.vertical_deadband_px)
+                if time.monotonic()-last_print >= 1/args.print_hz:
+                    print(
+                        f"side_samples={prediction.side_samples} "
+                        f"side_vu={prediction.side_velocity_u_px_s:+.1f}px/s "
+                        f"side_rms={prediction.side_fit_rms_px:.1f}px "
+                        f"catch_timestamp={prediction.catch_timestamp:.3f} "
+                        f"catch_in={prediction.time_to_catch_s:.3f}s | "
+                        f"front_samples={prediction.front_samples} "
+                        f"front_vu={prediction.front_velocity_u_px_s:+.1f}px/s "
+                        f"front_vv={prediction.front_velocity_v_px_s:+.1f}px/s "
+                        f"front_rms={prediction.front_fit_rms_px:.1f}px "
+                        f"predicted=({prediction.predicted_front_u_at_catch:.1f},"
+                        f"{prediction.predicted_front_v_at_catch:.1f})px "
+                        f"basket=({prediction.basket_u_px:.1f},{prediction.basket_v_px:.1f})px "
+                        f"error=({prediction.horizontal_error_px:+.1f},"
+                        f"{prediction.vertical_error_px:+.1f})px "
+                        f"decision={prediction.decision}", flush=True)
+                    last_print = time.monotonic()
+                if on_prediction is not None and not shared.committed:
+                    shared.committed = True
+                    shared.result = await on_prediction(prediction)
+                    shared.stopped = True
+            except ValueError:
+                pass
+        next_poll = max(next_poll + 1/args.poll_hz, time.monotonic())
+        await asyncio.sleep(max(0, next_poll-time.monotonic()))
+
+
+async def run(args, prediction_handler=None):
+    key_id, key = credentials(args.machine_config)
+    options = RobotClient.Options.with_api_key(api_key=key, api_key_id=key_id)
+    options.dial_options.disable_webrtc = True
+    options.dial_options.timeout = 10
+    detector_config = {
+        "hue_min": args.yellow_h_min,
+        "hue_max": args.yellow_h_max,
+        "saturation_min": args.yellow_s_min,
+        "value_min": args.yellow_v_min,
+        "min_area_px": args.min_area_px,
+        "min_circularity": args.min_circularity,
+    }
+    shared = SharedState()
+    async with await RobotClient.at_address("127.0.0.1:8080", options) as robot:
+        side = Camera.from_robot(robot, args.side_camera)
+        front = Camera.from_robot(robot, args.front_camera)
+        if prediction_handler is None:
+            print(f"Read-only RGB predictor: side={args.side_camera!r} "
+                  f"front={args.front_camera!r}; no robot motion.", flush=True)
+        else:
+            print(f"RGB predictor: side={args.side_camera!r} front={args.front_camera!r}; "
+                  "first valid prediction will be passed to the one-shot handler.", flush=True)
+        async def handle(prediction):
+            return await prediction_handler(robot, prediction)
+
+        tasks = [asyncio.create_task(side_loop(side, args, detector_config, shared)),
+                 asyncio.create_task(front_loop(
+                     front, args, detector_config, shared,
+                     handle if prediction_handler is not None else None))]
+        try:
+            if args.duration is None:
+                await asyncio.gather(*tasks)
+            else:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=args.duration)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            shared.stopped = True
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    return shared.result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--machine-config", type=Path, required=True)
+    parser.add_argument("--side-camera", default="cam2")
+    parser.add_argument("--front-camera", default="cam")
+    parser.add_argument("--color-source", default="color")
+    parser.add_argument("--catch-u-px", type=float, required=True)
+    parser.add_argument("--basket-u-px", type=float, required=True)
+    parser.add_argument("--basket-v-px", type=float, required=True)
+    parser.add_argument("--center-deadband-px", type=positive, default=25.0)
+    parser.add_argument("--vertical-deadband-px", type=positive, default=25.0)
+    parser.add_argument("--min-side-samples", type=int, default=7)
+    parser.add_argument("--min-front-samples", type=int, default=5)
+    parser.add_argument("--max-gap-s", type=positive, default=0.1)
+    parser.add_argument("--max-horizon-s", type=positive, default=0.6)
+    parser.add_argument("--held-speed-threshold-px-s", type=positive, default=40.0)
+    parser.add_argument("--release-speed-threshold-px-s", type=positive, default=150.0)
+    parser.add_argument("--release-min-consecutive-frames", type=int, default=2)
+    parser.add_argument("--held-min-duration-s", type=positive, default=0.15)
+    parser.add_argument("--invert-lateral", action="store_true")
+    parser.add_argument("--duration", type=positive)
+    parser.add_argument("--print-hz", type=positive, default=5.0)
+    parser.add_argument("--poll-hz", type=positive, default=120.0)
+    parser.add_argument("--max-age-s", type=positive, default=0.25)
+    parser.add_argument("--association-gate-px", type=positive, default=80.0)
+    parser.add_argument("--max-side-fit-error-px", "--max-side-error-px",
+                        dest="max_side_fit_error_px", type=positive, default=8.0)
+    parser.add_argument("--max-front-fit-error-px", "--max-front-error-px",
+                        dest="max_front_fit_error_px", type=positive, default=8.0)
+    parser.add_argument("--yellow-h-min", type=int, default=18)
+    parser.add_argument("--yellow-h-max", type=int, default=40)
+    parser.add_argument("--yellow-s-min", type=int, default=90)
+    parser.add_argument("--yellow-v-min", type=int, default=80)
+    parser.add_argument("--min-area-px", type=positive, default=60.0)
+    parser.add_argument("--min-circularity", type=positive, default=0.55)
+    args = parser.parse_args()
+    if args.min_side_samples < 5:
+        parser.error("--min-side-samples must be at least 5")
+    if args.min_front_samples < 2:
+        parser.error("--min-front-samples must be at least 2")
+    if args.release_min_consecutive_frames < 1:
+        parser.error("--release-min-consecutive-frames must be at least 1")
+    if args.release_speed_threshold_px_s <= args.held_speed_threshold_px_s:
+        parser.error("--release-speed-threshold-px-s must exceed the held threshold")
+    if not all(math.isfinite(value) for value in
+               (args.catch_u_px, args.basket_u_px, args.basket_v_px)):
+        parser.error("Catch and basket pixels must be finite")
+    try:
+        asyncio.run(run(args))
+    except KeyboardInterrupt:
+        print("\nPredictor stopped.")
+    except (ValueError, OSError, RuntimeError, asyncio.TimeoutError) as error:
+        parser.exit(2, f"Two-camera predictor failed: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

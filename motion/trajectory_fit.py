@@ -21,6 +21,73 @@ class PixelSample:
 
 
 @dataclass(frozen=True)
+class FrontSample:
+    timestamp: float
+    u: float
+    v: float = 0.0
+
+
+@dataclass(frozen=True)
+class FrontLateralFit:
+    timestamp: float
+    u_px: float
+    du_px_s: float
+    rms_error_px: float
+    v_px: float = 0.0
+    dv_px_s: float = 0.0
+    rms_u_px: float = 0.0
+    rms_v_px: float = 0.0
+
+    def predict_u(self, timestamp):
+        return self.u_px + self.du_px_s * (float(timestamp)-self.timestamp)
+
+    def predict_v(self, timestamp):
+        return self.v_px + self.dv_px_s * (float(timestamp)-self.timestamp)
+
+    def predict(self, timestamp):
+        return self.predict_u(timestamp), self.predict_v(timestamp)
+
+
+def fit_front_lateral(samples, *, min_samples=4, min_span_s=0.04,
+                      max_error_px=8.0):
+    """Fit front-camera u(t),v(t) at the same capture timestamps.
+
+    The historical function name is retained for Phase 2 compatibility.  A
+    linear short-horizon fit is intentionally used for both image axes.
+    """
+    dt = _times(samples, int(min_samples), float(min_span_s))
+    values = np.asarray([(sample.u, sample.v) for sample in samples], dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("Front-camera samples must be finite")
+    design = np.column_stack((np.ones(len(dt)), dt))
+    coefficients = np.linalg.lstsq(design, values, rcond=None)[0]
+    predicted = design @ coefficients
+    residuals = predicted - values
+    rms_u = float(np.sqrt(np.mean(residuals[:, 0]**2)))
+    rms_v = float(np.sqrt(np.mean(residuals[:, 1]**2)))
+    error = float(np.sqrt(np.mean(np.sum(residuals**2, axis=1))))
+    if not math.isfinite(error) or error > max_error_px:
+        raise ValueError(f"Unstable front trajectory: RMS error {error:.1f} px")
+    (u0, v0), (velocity_u, velocity_v) = coefficients
+    return FrontLateralFit(float(samples[-1].timestamp), float(u0),
+                           float(velocity_u), error, float(v0),
+                           float(velocity_v), rms_u, rms_v)
+
+
+def lateral_decision(error_px, deadband_px, invert=False):
+    """Classify signed image error; invert swaps labels, not error sign."""
+    error_px, deadband_px = float(error_px), float(deadband_px)
+    if not math.isfinite(error_px) or not math.isfinite(deadband_px) or deadband_px < 0:
+        raise ValueError("Lateral error/deadband must be finite and deadband nonnegative")
+    if abs(error_px) <= deadband_px:
+        return "CENTER"
+    decision = "LEFT" if error_px < 0 else "RIGHT"
+    if invert:
+        decision = "RIGHT" if decision == "LEFT" else "LEFT"
+    return decision
+
+
+@dataclass(frozen=True)
 class PixelFlight:
     timestamp: float
     u_px: float

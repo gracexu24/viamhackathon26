@@ -1,0 +1,30 @@
+{
+  "name": "T_world_from_cam2",
+  "source_frame": "cam2",
+  "destination_frame": "world",
+  "units": "millimeters",
+  "convention": "p_destination = T_destination_from_source @ [x, y, z, 1]",
+  "matrix": [
+    [0.995699, -0.086936, -0.032031, -1128.165],
+    [0.030140, -0.022972, 0.999282, -1179.987],
+    [-0.087609, -0.995949, -0.020253, 463.031],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "viam_frame": {
+    "parent": "world",
+    "translation": {
+      "x": -1128.165,
+      "y": -1179.987,
+      "z": 463.031
+    },
+    "orientation": {
+      "type": "quaternion",
+      "value": {
+        "w": 0.69865475,
+        "x": -0.71395446,
+        "y": 0.01988767,
+        "z": 0.04189339
+      }
+    }
+  }
+}
