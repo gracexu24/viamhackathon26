@@ -20,7 +20,7 @@ from viam.robot.client import RobotClient
 from motion.trajectory_fit import (
     FrontSample, PixelSample, fit_front_lateral, fit_pixel_flight, lateral_decision,
 )
-from motion.trajectory_local import credentials, decode_color, positive
+from vision.local_camera import credentials, decode_color, positive
 from vision.yellow_ball import TemporalPixelTracker, detect_yellow_candidates
 
 

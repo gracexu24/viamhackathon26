@@ -18,7 +18,7 @@ from viam.proto.common import Pose
 from viam.robot.client import RobotClient
 
 from motion import two_camera_rgb_local as phase2
-from motion.trajectory_local import credentials, positive
+from vision.local_camera import credentials, positive
 
 
 POSITION_AXES = ("x", "y", "z")

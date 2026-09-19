@@ -21,8 +21,8 @@ from motion.trajectory_fit import (
     PixelSample, PlaneSample, calibrate_plane_homography, fit_pixel_flight,
     fit_plane_ballistic, pixel_to_plane,
 )
-from motion.trajectory_local import credentials, decode_color, positive
 from vision.yellow_ball import TemporalPixelTracker, detect_yellow_candidates
+from vision.local_camera import credentials, decode_color, positive
 
 
 async def run(args):
