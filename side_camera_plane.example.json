@@ -1,0 +1,15 @@
+{
+  "warning": "PLACEHOLDERS ONLY: replace with measured matching points from the actual vertical throw plane",
+  "image_points_px": [
+    [100, 400],
+    [700, 400],
+    [100, 100],
+    [700, 100]
+  ],
+  "plane_points_mm": [
+    [0, 0],
+    [2000, 0],
+    [0, 1000],
+    [2000, 1000]
+  ]
+}
