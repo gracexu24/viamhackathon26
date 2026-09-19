@@ -1,6 +1,40 @@
 # viamhackathon26
 Fine Motor Skills Hackathon
 
+## Move to the closest point on a 3D trajectory
+
+`motion/move_to_trajectory.py` accepts either sampled world XYZ points or the
+gravity-constrained `WorldFlight` model from `motion/trajectory_fit.py`, reads the
+arm flange pose from Viam in `world`, and selects the geometrically closest point
+over the supplied polyline or prediction horizon. `trajectory.example.json`
+shows the sampled input format; coordinates are millimeters.
+
+Preview the calculation without moving hardware:
+
+```bash
+python -m motion.move_to_trajectory --trajectory trajectory.example.json
+```
+
+After replacing the example with a verified world-frame trajectory and checking
+the reported target, execute one physical move and retain a log:
+
+```bash
+python -m motion.move_to_trajectory \
+  --trajectory trajectory.json \
+  --workspace '[[0,-1000,0],[600,100,700]]' \
+  --log-file move-to-trajectory.log \
+  --execute
+```
+
+The move preserves the current flange orientation and uses one unconstrained
+Viam Motion service request, with no artificial delay or intermediate waypoint.
+The actual maximum speed remains controlled by the arm driver and machine
+configuration; the Python Motion API does not provide a per-call maximum-speed
+override. Viam still plans against configured kinematics and collision geometry.
+On a failed move, timeout, cancellation, or arrival-verification failure, the
+program requests an arm stop. The destination selection is purely geometric;
+it does not yet account for whether the arm and ball reach that point together.
+
 ## Stationary grab using Viam services
 
 New additive entry point: `motion/viam_stationary_grab.py`. It uses `cam`,
