@@ -9,7 +9,8 @@ from motion.trajectory_fit import (
     FrontSample, PixelSample, fit_front_lateral, lateral_decision,
 )
 from vision.yellow_ball import (
-    TemporalPixelTracker, YellowCandidate, detect_yellow_candidates,
+    BallReleaseDetector, PixelMeasurement, TemporalPixelTracker,
+    YellowCandidate, detect_yellow_candidates,
 )
 
 
@@ -48,6 +49,56 @@ class TemporalTrackerTests(unittest.TestCase):
         tracker.update(2.101, [])
         self.assertFalse(tracker.is_active(2.101))
         self.assertIsNone(tracker.last_measurement)
+
+
+class BallReleaseDetectorTests(unittest.TestCase):
+    @staticmethod
+    def measurement(timestamp, u, v=100):
+        return PixelMeasurement(timestamp, u, v, 10)
+
+    def test_stationary_ball_becomes_held_without_releasing(self):
+        detector = BallReleaseDetector(40, 150, 2, .15)
+        events = [detector.update(self.measurement(i*.05, 100)) for i in range(8)]
+        self.assertEqual(detector.state, detector.HELD)
+        self.assertFalse(detector.released)
+        self.assertTrue(all(event is None for event in events))
+
+    def test_small_hand_jitter_does_not_release(self):
+        detector = BallReleaseDetector(40, 150, 2, .15)
+        points = [100, 100.5, 99.5, 100.5, 100, 101, 100.5, 100]
+        events = [detector.update(self.measurement(i*.05, u))
+                  for i, u in enumerate(points)]
+        self.assertEqual(detector.state, detector.HELD)
+        self.assertTrue(all(event is None for event in events))
+
+    def test_release_fires_once_and_keeps_first_fast_measurements(self):
+        detector = BallReleaseDetector(40, 150, 2, .15)
+        for i in range(5):
+            self.assertIsNone(detector.update(self.measurement(i*.05, 100)))
+        first_fast = self.measurement(.25, 110)
+        second_fast = self.measurement(.30, 122)
+        self.assertIsNone(detector.update(first_fast))
+        event = detector.update(second_fast)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.release_id, 1)
+        self.assertEqual(event.timestamp, first_fast.timestamp)
+        self.assertEqual(event.flight_measurements, (first_fast, second_fast))
+        for measurement in (self.measurement(.35, 136), self.measurement(.40, 152)):
+            self.assertIsNone(detector.update(measurement))
+
+    def test_reset_allows_next_track_and_increments_release_id(self):
+        detector = BallReleaseDetector(40, 150, 2, .10)
+
+        def throw(offset):
+            for i in range(4):
+                detector.update(self.measurement(offset+i*.05, 100))
+            detector.update(self.measurement(offset+.20, 110))
+            return detector.update(self.measurement(offset+.25, 122))
+
+        self.assertEqual(throw(0).release_id, 1)
+        detector.reset()
+        self.assertEqual(detector.state, detector.UNKNOWN)
+        self.assertEqual(throw(1).release_id, 2)
 
 
 class PredictionTests(unittest.TestCase):

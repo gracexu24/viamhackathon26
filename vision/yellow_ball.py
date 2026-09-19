@@ -34,6 +34,104 @@ class PixelMeasurement:
     radius_px: float
 
 
+@dataclass(frozen=True)
+class BallReleaseEvent:
+    release_id: int
+    timestamp: float
+    speed_px_s: float
+    flight_measurements: tuple[PixelMeasurement, ...]
+
+
+class BallReleaseDetector:
+    """Detect one HELD -> RELEASED transition from real pixel measurements.
+
+    Association predictions must never be passed here. ``update`` expects only
+    measurements accepted from an actual camera frame. A reset starts the held
+    search for a new track while preserving the monotonically increasing
+    release ID.
+    """
+
+    UNKNOWN = "UNKNOWN"
+    HELD = "HELD"
+    RELEASED = "RELEASED"
+
+    def __init__(self, held_speed_threshold_px_s=40.0,
+                 release_speed_threshold_px_s=150.0,
+                 release_min_consecutive_frames=2, held_min_duration_s=0.15):
+        self.held_speed_threshold_px_s = float(held_speed_threshold_px_s)
+        self.release_speed_threshold_px_s = float(release_speed_threshold_px_s)
+        self.release_min_consecutive_frames = int(release_min_consecutive_frames)
+        self.held_min_duration_s = float(held_min_duration_s)
+        values = (self.held_speed_threshold_px_s,
+                  self.release_speed_threshold_px_s,
+                  self.held_min_duration_s)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Release detector thresholds must be finite")
+        if self.held_speed_threshold_px_s < 0 or self.held_min_duration_s < 0:
+            raise ValueError("Held speed and duration must be nonnegative")
+        if self.release_speed_threshold_px_s <= self.held_speed_threshold_px_s:
+            raise ValueError("Release speed must exceed held speed")
+        if self.release_min_consecutive_frames < 1:
+            raise ValueError("Release confirmation requires at least one frame")
+        self.release_id = 0
+        self.reset()
+
+    @property
+    def released(self):
+        return self.state == self.RELEASED
+
+    def reset(self):
+        """Reset track-local state without reusing a previous release ID."""
+        self.state = self.UNKNOWN
+        self.previous = None
+        self._held_since = None
+        self._release_measurements = []
+
+    def update(self, measurement):
+        """Consume one real accepted measurement and return a one-time event."""
+        values = np.asarray(
+            [measurement.timestamp, measurement.u, measurement.v], dtype=float)
+        if values.shape != (3,) or not np.isfinite(values).all():
+            raise ValueError("Release measurements must contain finite timestamp, u and v")
+        if self.previous is None:
+            self.previous = measurement
+            return None
+        dt = float(measurement.timestamp) - float(self.previous.timestamp)
+        if dt <= 0:
+            raise ValueError("Release measurement timestamps must increase")
+        speed = math.hypot(
+            float(measurement.u)-float(self.previous.u),
+            float(measurement.v)-float(self.previous.v)) / dt
+
+        if self.state == self.UNKNOWN:
+            if speed <= self.held_speed_threshold_px_s:
+                if self._held_since is None:
+                    self._held_since = float(self.previous.timestamp)
+                if float(measurement.timestamp)-self._held_since >= self.held_min_duration_s:
+                    self.state = self.HELD
+            else:
+                self._held_since = None
+        elif self.state == self.HELD:
+            if speed >= self.release_speed_threshold_px_s:
+                self._release_measurements.append(measurement)
+                if len(self._release_measurements) >= self.release_min_consecutive_frames:
+                    self.state = self.RELEASED
+                    self.release_id += 1
+                    event = BallReleaseEvent(
+                        release_id=self.release_id,
+                        timestamp=float(self._release_measurements[0].timestamp),
+                        speed_px_s=float(speed),
+                        flight_measurements=tuple(self._release_measurements),
+                    )
+                    self.previous = measurement
+                    return event
+            else:
+                self._release_measurements.clear()
+
+        self.previous = measurement
+        return None
+
+
 def detect_yellow_candidates(bgr, config=None):
     """Return every plausible yellow circular blob, largest first."""
     if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:

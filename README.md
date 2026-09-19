@@ -66,6 +66,14 @@ Use `--front-camera cam1` if that is the installed resource name. The result
 contains catch time, predicted front `(u,v)`, basket `(u,v)`, both signed image
 errors, and side/front fit quality.
 
+The side camera first confirms that the ball is held, then emits one release
+event after sustained fast motion. Both camera histories are cleared at that
+event, so trajectory fits contain only real post-release measurements. Tune
+this behavior with `--held-speed-threshold-px-s`,
+`--release-speed-threshold-px-s`, `--release-min-consecutive-frames`, and
+`--held-min-duration-s`. Predicted tracker positions are used only for
+association and never enter release detection or trajectory fitting.
+
 ## Cam2 transform
 
 The measured fixed-camera calibration is stored in `cam2_transform.json` as

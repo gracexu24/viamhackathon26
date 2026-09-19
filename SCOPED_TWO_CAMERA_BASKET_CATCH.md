@@ -17,6 +17,8 @@ remain separate from robot motion.
 cam2 color frames
   -> yellow HSV candidates
   -> temporal association
+  -> HELD then RELEASED state transition
+  -> clear pre-release history
   -> u(t) linear fit and v(t) quadratic fit
   -> future crossing of catch_u_px
   -> catch_timestamp
@@ -37,7 +39,9 @@ structured prediction
 ```
 
 Both streams use camera capture timestamps. Duplicate, stale, ambiguous, and
-poor-fit observations are rejected.
+poor-fit observations are rejected. Cam2 owns the shared release event; the
+front loop clears its history on the same release ID and accepts only real
+measurements at or after that release timestamp.
 
 ## Current modules
 

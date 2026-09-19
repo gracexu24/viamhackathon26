@@ -21,7 +21,9 @@ from motion.trajectory_fit import (
     FrontSample, PixelSample, fit_front_lateral, fit_pixel_flight, lateral_decision,
 )
 from vision.local_camera import credentials, decode_color, positive
-from vision.yellow_ball import TemporalPixelTracker, detect_yellow_candidates
+from vision.yellow_ball import (
+    BallReleaseDetector, TemporalPixelTracker, detect_yellow_candidates,
+)
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,9 @@ class CatchPrediction:
 @dataclass
 class SharedState:
     side_catch: SideCatchPrediction | None = None
+    release_id: int = 0
+    release_timestamp: float | None = None
+    released: bool = False
     stopped: bool = False
     committed: bool = False
     result: object = None
@@ -135,6 +140,12 @@ def combine_prediction(side_catch, front_samples, front_fit, basket_u_px,
 
 async def side_loop(camera, args, detector_config, shared):
     tracker = TemporalPixelTracker(args.max_gap_s, args.association_gate_px)
+    release_detector = BallReleaseDetector(
+        args.held_speed_threshold_px_s,
+        args.release_speed_threshold_px_s,
+        args.release_min_consecutive_frames,
+        args.held_min_duration_s,
+    )
     history = deque(maxlen=max(12, args.min_side_samples * 2))
     track_id = tracker.track_id
     last_timestamp = None
@@ -162,10 +173,27 @@ async def side_loop(camera, args, detector_config, shared):
         if measurement is not None:
             if tracker.track_id != track_id:
                 history.clear()
+                release_detector.reset()
+                shared.released = False
+                shared.release_timestamp = None
+                shared.side_catch = None
                 track_id = tracker.track_id
-            history.append(PixelSample(measurement.timestamp, measurement.u, measurement.v))
+            release = release_detector.update(measurement)
+            if release is not None:
+                history.clear()
+                history.extend(PixelSample(item.timestamp, item.u, item.v)
+                               for item in release.flight_measurements)
+                shared.release_id = release.release_id
+                shared.release_timestamp = release.timestamp
+                shared.released = True
+                print(f"release_detected t={release.timestamp:.3f} "
+                      f"speed={release.speed_px_s:.1f}px/s "
+                      f"release_id={release.release_id}", flush=True)
+            elif release_detector.released:
+                history.append(PixelSample(
+                    measurement.timestamp, measurement.u, measurement.v))
             shared.side_catch = None
-            if len(history) >= args.min_side_samples:
+            if shared.released and len(history) >= args.min_side_samples:
                 try:
                     shared.side_catch = predict_side_catch(
                         history, args.catch_u_px, args.max_horizon_s,
@@ -174,6 +202,9 @@ async def side_loop(camera, args, detector_config, shared):
                     shared.side_catch = None
         elif not tracker.is_active(timestamp):
             history.clear()
+            release_detector.reset()
+            shared.released = False
+            shared.release_timestamp = None
             shared.side_catch = None
         next_poll = max(next_poll + 1/args.poll_hz, time.monotonic())
         await asyncio.sleep(max(0, next_poll-time.monotonic()))
@@ -183,6 +214,7 @@ async def front_loop(camera, args, detector_config, shared, on_prediction=None):
     tracker = TemporalPixelTracker(args.max_gap_s, args.association_gate_px)
     history = deque(maxlen=max(12, args.min_front_samples * 2))
     track_id = tracker.track_id
+    release_id = shared.release_id
     last_timestamp = None
     reported_ready = False
     last_print = float("-inf")
@@ -210,8 +242,16 @@ async def front_loop(camera, args, detector_config, shared, on_prediction=None):
             if tracker.track_id != track_id:
                 history.clear()
                 track_id = tracker.track_id
-            history.append(FrontSample(measurement.timestamp, measurement.u, measurement.v))
+            if shared.release_id != release_id:
+                history.clear()
+                release_id = shared.release_id
+            if (shared.released and shared.release_timestamp is not None
+                    and measurement.timestamp >= shared.release_timestamp):
+                history.append(FrontSample(
+                    measurement.timestamp, measurement.u, measurement.v))
         elif not tracker.is_active(timestamp):
+            history.clear()
+        if not shared.released:
             history.clear()
         side_catch = shared.side_catch
         if side_catch is not None and side_catch.catch_timestamp <= timestamp:
@@ -317,6 +357,10 @@ def main():
     parser.add_argument("--min-front-samples", type=int, default=5)
     parser.add_argument("--max-gap-s", type=positive, default=0.1)
     parser.add_argument("--max-horizon-s", type=positive, default=0.6)
+    parser.add_argument("--held-speed-threshold-px-s", type=positive, default=40.0)
+    parser.add_argument("--release-speed-threshold-px-s", type=positive, default=150.0)
+    parser.add_argument("--release-min-consecutive-frames", type=int, default=2)
+    parser.add_argument("--held-min-duration-s", type=positive, default=0.15)
     parser.add_argument("--invert-lateral", action="store_true")
     parser.add_argument("--duration", type=positive)
     parser.add_argument("--print-hz", type=positive, default=5.0)
@@ -338,6 +382,10 @@ def main():
         parser.error("--min-side-samples must be at least 5")
     if args.min_front_samples < 2:
         parser.error("--min-front-samples must be at least 2")
+    if args.release_min_consecutive_frames < 1:
+        parser.error("--release-min-consecutive-frames must be at least 1")
+    if args.release_speed_threshold_px_s <= args.held_speed_threshold_px_s:
+        parser.error("--release-speed-threshold-px-s must exceed the held threshold")
     if not all(math.isfinite(value) for value in
                (args.catch_u_px, args.basket_u_px, args.basket_v_px)):
         parser.error("Catch and basket pixels must be finite")
