@@ -1,14 +1,12 @@
 # Viam Two-Camera Ball Catch
 
-This repository contains the perception and motion building blocks for catching a
-ball with a Viam-controlled arm. The current pipeline tracks a yellow ball in two
-RGB camera streams, predicts where it will cross a configured catch line, and
-classifies that crossing as `LEFT`, `CENTER`, or `RIGHT`. A separate motion tool
-can move the arm to the closest point on a supplied 3D trajectory.
+This repository contains perception and trajectory-estimation building blocks
+for catching a ball with a Viam-controlled arm. The current two-camera pipeline
+tracks a yellow ball in RGB streams, predicts where it will cross a configured
+catch line, and classifies that crossing as `LEFT`, `CENTER`, or `RIGHT`.
 
-The two pieces are intentionally separate today: the camera predictor does not
-yet produce a world-frame 3D trajectory, and there is no integrated real-time
-catch controller.
+The predictor is read-only. It does not command the arm, and there is not yet an
+integrated real-time catch controller.
 
 ## Current pipeline
 
@@ -19,14 +17,10 @@ side camera (cam2) -> yellow-ball samples -> parabolic side fit
                                     catch-line timestamp
                                               |
 front camera (cam) -> yellow-ball samples -> lateral fit -> LEFT/CENTER/RIGHT
-
-3D trajectory JSON or WorldFlight -> closest world-frame point -> Viam Motion move
 ```
 
-`motion/two_camera_rgb_local.py` is read-only: it opens the two cameras, tracks
-the ball, and prints a prediction. It does not command the arm. Arm motion is
-handled separately by `motion/move_to_trajectory.py` and defaults to preview
-mode.
+`motion/two_camera_rgb_local.py` opens the two cameras, tracks the ball, and
+prints predictions without importing or calling robot-motion APIs.
 
 ## Setup
 
@@ -51,7 +45,7 @@ machine configuration and connect to the local server at `127.0.0.1:8080`.
 
 ## Run the two-camera predictor
 
-First measure these pixel coordinates from your installed camera views:
+First measure these pixel coordinates from the installed camera views:
 
 - `--catch-u-px`: the side-camera horizontal pixel where the ball reaches the
   catch plane.
@@ -76,69 +70,13 @@ at that same capture timestamp. The final output reports `LEFT`, `CENTER`, or
 `RIGHT` relative to the configured basket center. Camera names and thresholds
 can be adjusted with `python -m motion.two_camera_rgb_local --help`.
 
-## Move the arm toward a 3D trajectory
+## Safety and limitations
 
-`motion/move_to_trajectory.py` reads the arm flange pose from Viam, finds the
-geometrically closest point on a world-frame trajectory, preserves the current
-flange orientation, and asks Viam Motion for one planned move.
-
-It accepts either a sampled polyline:
-
-```json
-{
-  "reference_frame": "world",
-  "points": [[100, 0, 300], [250, 40, 350], [400, 80, 300]]
-}
-```
-
-or a quadratic flight model:
-
-```json
-{
-  "reference_frame": "world",
-  "timestamp": 0.0,
-  "position_mm": [100, 0, 300],
-  "velocity_mm_s": [500, 100, 600],
-  "acceleration_mm_s2": [0, 0, -9810],
-  "rms_error_mm": 8.0
-}
-```
-
-Preview a target without moving hardware:
-
-```bash
-python -m motion.move_to_trajectory \
-  --trajectory trajectory.example.json
-```
-
-Execute only after supplying an explicit allowed workspace:
-
-```bash
-python -m motion.move_to_trajectory \
-  --trajectory trajectory.json \
-  --workspace '[[0,-1000,0],[600,100,700]]' \
-  --log-file move-to-trajectory.log \
-  --execute
-```
-
-The workspace is an axis-aligned box described by minimum and maximum XYZ
-corners in millimetres. Targets outside it are rejected. The command logs the
-input, current pose, chosen target, requested move, result, and failures.
-
-This tool selects the nearest geometric point only; it does not synchronize the
-arm's arrival with the ball. The Python Motion API also does not expose a
-per-call “maximum speed” switch, so actual speed and acceleration remain subject
-to the arm driver, Viam configuration, planning, and collision constraints.
-
-## Safety
-
-- Run in preview mode before every new trajectory or workspace.
-- Keep people and loose objects outside the robot workspace.
-- Configure Viam frame-system geometry and collision constraints for the real
-  installation.
-- Give only one process control of the arm at a time.
-- Use an emergency stop and conservative workspace bounds during testing.
+- The current two-camera command is prediction-only; it does not move hardware.
+- Its output is pixel-relative and does not provide a world-frame 3D arm target.
 - Do not treat this prototype as a time-synchronized catch controller.
+- Run legacy motion experiments only with exclusive arm control, verified Viam
+  collision geometry, conservative workspace bounds, and an emergency stop.
 
 ## Supporting tools
 
@@ -166,15 +104,15 @@ python -m unittest discover -s tests -v
 ```
 
 The live desktop preview and its two import-level tests require a Python
-installation with Tk support. Headless perception, fitting, and motion-planning
-tests do not require a display.
+installation with Tk support. Headless perception and trajectory-fitting tests
+do not require a display.
 
 ## Project layout
 
 ```text
-motion/       trajectory fitting, prediction, and Viam motion commands
+motion/       trajectory fitting, prediction, and legacy Viam motion workflows
 vision/       camera detection and diagnostic utilities
 tests/        unit tests with mocked Viam hardware
-*.json        calibration and trajectory examples
+*.json        calibration examples
 connection.py shared Viam connection helpers
 ```
