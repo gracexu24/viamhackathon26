@@ -31,7 +31,7 @@ front-camera color frames
   -> horizontal_error_px, vertical_error_px
 
 structured prediction
-  -> validate age, timing, lead time, and fit quality
+  -> validate age, timing, and fit quality
   -> independent deadbands, signs, and pixel/mm scales
   -> two configured catch-plane axes
   -> fixed plane-normal coordinate and basket orientation
@@ -125,7 +125,6 @@ are `null`. They must be measured on the real UF850 setup.
 - Two in-plane UF850 axes and the remaining plane-normal axis/value.
 - Direction sign and millimetres per pixel for both image dimensions.
 - Safe absolute bounds and maximum correction for both movable axes.
-- Conservative measured minimum lead time.
 - Yellow HSV/circularity thresholds for actual lighting.
 
 ## Testing order
@@ -147,4 +146,4 @@ are `null`. They must be measured on the real UF850 setup.
 6. Dry-run never reaches an arm resource.
 7. Valid execution sends exactly one movement command.
 8. Failed movement does not retry.
-9. Physical calibration verifies the safe region and measured lead time.
+9. Physical calibration verifies the safe region.

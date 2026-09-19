@@ -27,7 +27,6 @@ class LateralCatchConfig:
     max_lateral_move_mm: float
     lateral_min_mm: float
     lateral_max_mm: float
-    minimum_lead_time_s: float
     max_prediction_age_s: float = 0.15
     center_deadband_px: float = 25.0
     robot_sign_for_positive_error: float = 1.0
@@ -59,8 +58,8 @@ def validate_config(config):
         raise ValueError("base_pose must be an object containing a tested catch-ready pose")
     for key in ("x", "y", "z", "o_x", "o_y", "o_z", "theta"):
         _finite(config.base_pose.get(key), f"base_pose.{key}")
-    for key in ("mm_per_pixel", "max_lateral_move_mm", "minimum_lead_time_s",
-                "max_prediction_age_s", "rpc_timeout_s"):
+    for key in ("mm_per_pixel", "max_lateral_move_mm", "max_prediction_age_s",
+                "rpc_timeout_s"):
         if _finite(getattr(config, key), key) <= 0:
             raise ValueError(f"{key} must be positive")
     lower = _finite(config.lateral_min_mm, "lateral_min_mm")
@@ -95,8 +94,6 @@ def validate_prediction(prediction, *, now_s=None, config):
         prediction_value(prediction, name)
     if time_to_catch <= 0 or catch_timestamp <= now_s:
         raise ValueError("prediction is stale or catch time is not in the future")
-    if catch_timestamp - now_s < config.minimum_lead_time_s:
-        raise ValueError("insufficient_lead_time")
     if abs((catch_timestamp - now_s) - time_to_catch) > max(config.max_prediction_age_s, 0.05):
         raise ValueError("prediction timing is stale or inconsistent")
     if abs(error_px) > config.max_lateral_move_mm / config.mm_per_pixel:
@@ -169,6 +166,9 @@ async def run_lateral_catch(machine, prediction, config, *, execute=False, now_s
 
 
 def config_from_mapping(raw):
+    # Accept old config files while intentionally ignoring the retired timing gate.
+    raw = dict(raw)
+    raw.pop("minimum_lead_time_s", None)
     return LateralCatchConfig(**raw)
 
 
@@ -195,8 +195,6 @@ def main():
         if not result["success"]:
             raise SystemExit(2)
     except (ValueError, OSError, RuntimeError, TimeoutError) as error:
-        if str(error) == "insufficient_lead_time":
-            print("decision=ABORT reason=insufficient_lead_time", flush=True)
         parser.exit(2, f"Lateral catch failed: {error}\n")
 
 

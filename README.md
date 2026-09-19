@@ -99,7 +99,7 @@ rather than a camera-frame 3D point.
 Copy `intercept_controller.config.example.json` to
 `intercept_controller.config.json` and replace every `null` with a physically
 measured value. The example is deliberately non-runnable: axes, signs, scales,
-pose, bounds, plane coordinate, and lead time must not be guessed.
+pose, bounds, and plane coordinate must not be guessed.
 
 Integrated live dry run:
 
@@ -120,10 +120,11 @@ resource. After dry-run and supervised no-ball calibration, add `--execute` to
 allow exactly one `move_to_position` command. Restart the command for each catch
 attempt.
 
-The controller validates prediction validity, age, timing, lead time, fit errors,
+The controller validates prediction validity, age, timing, fit errors,
 independent deadbands, movement limits, rectangular in-plane bounds, fixed plane
-normal, fixed orientation, and idle arm state. An execution failure is stopped
-and is never retried automatically.
+normal, fixed orientation, and idle arm state. A valid reachable target is sent
+to the arm even when little time remains before the predicted catch. An execution
+failure is stopped and is never retried automatically.
 
 ## Safety and calibration
 

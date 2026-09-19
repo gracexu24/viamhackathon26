@@ -17,7 +17,6 @@
   "horizontal_max_mm": null,
   "vertical_min_mm": null,
   "vertical_max_mm": null,
-  "minimum_lead_time_s": null,
   "max_prediction_age_s": 0.15,
   "max_side_fit_error_px": 8.0,
   "max_front_fit_error_px": 8.0,

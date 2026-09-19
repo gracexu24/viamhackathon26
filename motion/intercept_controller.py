@@ -45,7 +45,6 @@ class InterceptConfig:
     horizontal_max_mm: float
     vertical_min_mm: float
     vertical_max_mm: float
-    minimum_lead_time_s: float
     max_prediction_age_s: float
     max_side_fit_error_px: float
     max_front_fit_error_px: float
@@ -98,7 +97,7 @@ def validate_config(config):
     fixed_plane = _finite(config.fixed_plane_value_mm, "fixed_plane_value_mm")
     for name in ("horizontal_mm_per_pixel", "vertical_mm_per_pixel",
                  "max_horizontal_move_mm", "max_vertical_move_mm",
-                 "minimum_lead_time_s", "max_prediction_age_s",
+                 "max_prediction_age_s",
                  "max_side_fit_error_px", "max_front_fit_error_px", "rpc_timeout_s"):
         if _finite(getattr(config, name), name) <= 0:
             raise ValueError(f"{name} must be positive")
@@ -146,7 +145,7 @@ def image_error_to_plane_offset(horizontal_error_px, vertical_error_px, config):
 
 
 def validate_prediction(prediction, config, *, now_s=None):
-    """Reject an invalid/stale/late Phase 2 result before target generation."""
+    """Reject an invalid, stale, or unsafe Phase 2 result before target generation."""
     validate_config(config)
     valid = prediction.get("valid") if isinstance(prediction, dict) else getattr(prediction, "valid", None)
     if valid is not True:
@@ -169,8 +168,6 @@ def validate_prediction(prediction, config, *, now_s=None):
     if abs((catch_timestamp - predicted_at) - reported_time_to_catch) > 0.05:
         raise ValueError("inconsistent_prediction_timing")
     catch_in = catch_timestamp - now_s
-    if catch_in <= config.minimum_lead_time_s:
-        raise ValueError("insufficient_lead_time")
     if side_rms > config.max_side_fit_error_px or front_rms > config.max_front_fit_error_px:
         raise ValueError("fit_quality_outside_limits")
     offset = image_error_to_plane_offset(horizontal_error, vertical_error, config)
@@ -272,6 +269,9 @@ async def execute_intercept(machine, prediction, config, *, execute=False, now_s
 
 
 def config_from_mapping(raw):
+    # Accept old config files while intentionally ignoring the retired timing gate.
+    raw = dict(raw)
+    raw.pop("minimum_lead_time_s", None)
     try:
         config = InterceptConfig(**raw)
     except TypeError as error:
@@ -285,7 +285,7 @@ def _apply_cli_overrides(raw, args):
         "arm", "horizontal_axis", "vertical_axis", "plane_normal_axis",
         "fixed_plane_value_mm", "horizontal_mm_per_pixel", "vertical_mm_per_pixel",
         "horizontal_deadband_px", "vertical_deadband_px",
-        "max_horizontal_move_mm", "max_vertical_move_mm", "minimum_lead_time_s",
+        "max_horizontal_move_mm", "max_vertical_move_mm",
         "horizontal_min_mm", "horizontal_max_mm", "vertical_min_mm", "vertical_max_mm",
         "invert_horizontal", "invert_vertical",
     )
@@ -341,7 +341,6 @@ def _parser():
     parser.add_argument("--vertical-deadband-px", type=float)
     parser.add_argument("--max-horizontal-move-mm", type=positive)
     parser.add_argument("--max-vertical-move-mm", type=positive)
-    parser.add_argument("--minimum-lead-time-s", type=positive)
     parser.add_argument("--invert-horizontal", action="store_true", default=None)
     parser.add_argument("--invert-vertical", action="store_true", default=None)
     parser.add_argument("--horizontal-axis", choices=POSITION_AXES)

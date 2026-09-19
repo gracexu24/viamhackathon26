@@ -20,7 +20,7 @@ def config(**overrides):
         max_horizontal_move_mm=80.0, max_vertical_move_mm=60.0,
         horizontal_min_mm=20.0, horizontal_max_mm=180.0,
         vertical_min_mm=100.0, vertical_max_mm=300.0,
-        minimum_lead_time_s=0.5, max_prediction_age_s=0.15,
+        max_prediction_age_s=0.15,
         max_side_fit_error_px=8.0, max_front_fit_error_px=8.0,
         rpc_timeout_s=1.0,
     )
@@ -106,9 +106,10 @@ class MappingTests(unittest.TestCase):
         pose = target.target_pose
         self.assertEqual((pose.o_x, pose.o_y, pose.o_z, pose.theta), (0, 0, -1, 180))
 
-    def test_insufficient_lead_time_rejected(self):
-        with self.assertRaisesRegex(ValueError, "insufficient_lead_time"):
-            validate_prediction(prediction(predicted_at=100, catch=100.4), config(), now_s=100.05)
+    def test_short_lead_time_is_accepted(self):
+        catch_in, _ = validate_prediction(
+            prediction(predicted_at=100, catch=100.4), config(), now_s=100.05)
+        self.assertAlmostEqual(catch_in, 0.35)
 
     def test_stale_prediction_rejected(self):
         with self.assertRaisesRegex(ValueError, "stale_prediction"):
@@ -141,6 +142,17 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["action"], "MOVED_AND_HOLDING")
         arm.move_to_position.assert_awaited_once()
         arm.stop.assert_not_awaited()
+
+    async def test_short_lead_time_still_sends_arm_move(self):
+        arm = SimpleNamespace(is_moving=AsyncMock(return_value=False),
+                              move_to_position=AsyncMock(), stop=AsyncMock())
+        short_lead = prediction(predicted_at=100.0, catch=100.1)
+        with patch("motion.intercept_controller.Arm.from_robot", return_value=arm):
+            result = await execute_intercept(
+                object(), short_lead, config(), execute=True, now_s=100.05)
+        self.assertEqual(result["action"], "MOVED_AND_HOLDING")
+        self.assertAlmostEqual(result["catch_in_s"], 0.05)
+        arm.move_to_position.assert_awaited_once()
 
     async def test_failed_motion_is_not_retried(self):
         arm = SimpleNamespace(is_moving=AsyncMock(return_value=False),

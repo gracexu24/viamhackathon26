@@ -15,7 +15,7 @@ def config(**overrides):
                    "o_z": -1, "theta": 180},
         mm_per_pixel=2.0, max_lateral_move_mm=80.0,
         lateral_min_mm=20.0, lateral_max_mm=180.0,
-        minimum_lead_time_s=.5, max_prediction_age_s=.15,
+        max_prediction_age_s=.15,
         center_deadband_px=10.0, robot_sign_for_positive_error=1.0,
         rpc_timeout_s=1.0,
     )
@@ -57,9 +57,10 @@ class LateralMappingTests(unittest.TestCase):
                 "x": 10, "y": 30, "z": 500, "o_x": 0, "o_y": 0,
                 "o_z": -1, "theta": 180}))
 
-    def test_prediction_validation_rejects_insufficient_lead(self):
-        with self.assertRaisesRegex(ValueError, "insufficient_lead_time"):
-            validate_prediction(prediction(catch=100.2), now_s=100, config=config())
+    def test_prediction_validation_accepts_short_lead(self):
+        _, catch_in, _ = validate_prediction(
+            prediction(catch=100.2), now_s=100, config=config())
+        self.assertAlmostEqual(catch_in, 0.2)
 
     def test_prediction_validation_rejects_stale(self):
         with self.assertRaisesRegex(ValueError, "stale"):
